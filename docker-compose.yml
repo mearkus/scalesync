@@ -1,0 +1,15 @@
+services:
+  scalesync:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    environment:
+      - WYZE_EMAIL=${WYZE_EMAIL}
+      - WYZE_PASSWORD=${WYZE_PASSWORD}
+      - WYZE_KEY_ID=${WYZE_KEY_ID}
+      - WYZE_API_KEY=${WYZE_API_KEY}
+      - GARMIN_EMAIL=${GARMIN_EMAIL}
+      - GARMIN_PASSWORD=${GARMIN_PASSWORD}
+      - SYNC_INTERVAL=${SYNC_INTERVAL:-30}
+      - DATA_DIR=/data
