@@ -1,0 +1,50 @@
+name: Sync Wyze Scale → Garmin Connect
+
+# Runs every 6 hours automatically, or trigger manually from the Actions tab.
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    name: Sync scale data
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # Persist Garmin OAuth tokens and the list of already-synced checksums
+      # between workflow runs so we don't re-upload duplicates or re-login every time.
+      - name: Restore sync state
+        uses: actions/cache@v4
+        with:
+          path: data/
+          # New key each run so the latest state is always saved.
+          key: scalesync-state-${{ github.run_id }}
+          restore-keys: |
+            scalesync-state-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          WYZE_EMAIL:    ${{ secrets.WYZE_EMAIL }}
+          WYZE_PASSWORD: ${{ secrets.WYZE_PASSWORD }}
+          WYZE_KEY_ID:   ${{ secrets.WYZE_KEY_ID }}
+          WYZE_API_KEY:  ${{ secrets.WYZE_API_KEY }}
+          GARMIN_EMAIL:    ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          # Point state files at the cached data directory
+          DATA_DIR: data
+        # Call sync_once() directly — no infinite loop needed in CI.
+        run: python -c "from sync import sync_once; sync_once()"
