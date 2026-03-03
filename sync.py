@@ -56,6 +56,14 @@ SYNCED_FILE = os.path.join(DATA_DIR, "synced.txt")
 
 # Wyze weight is reported in lbs; Garmin requires kg
 LBS_TO_KG = 0.45359237
+# Newer/unknown Wyze scale variants may come through as product_type="Common"
+# until wyze-sdk adds explicit mappings.
+KNOWN_WYZE_SCALE_MODELS = {
+    "WL_SC2",
+    "WL_SCA",
+    "WL_SCL",
+    "WL_SCU",
+}
 
 # Newer/unknown Wyze scale variants may come through as product_type="Common"
 # until wyze-sdk adds explicit mappings.
@@ -278,6 +286,10 @@ def sync_once():
             scale = client.scales.info(device_mac=device.mac)
         except WyzeApiError as exc:
             log.error("Failed to fetch scale info for %s: %s", device.mac, exc)
+            continue
+
+        if scale is None:
+            log.warning("Wyze returned no scale info for %s; skipping this device.", device.mac)
             continue
 
         records = scale.latest_records or []
