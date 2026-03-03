@@ -1,6 +1,6 @@
 # scalesync
 
-Syncs body-composition measurements from a **Wyze Scale** to **Garmin Connect** as FIT files.
+Syncs body-composition measurements from a **Wyze Scale** to **Garmin Connect**.
 
 Supports two deployment modes:
 
@@ -14,8 +14,8 @@ Supports two deployment modes:
 ## How it works
 
 1. Authenticates with the Wyze API and fetches all scale records.
-2. Converts each measurement to a FIT file (Garmin's native binary format) via `fit.py`.
-3. Uploads each FIT file to Garmin Connect via `garth`.
+2. Maps each measurement to Garmin body-composition fields.
+3. Uploads each measurement to Garmin Connect via `python-garminconnect`.
 4. Tracks uploaded checksums in `data/synced.txt` so nothing is uploaded twice.
 
 ---

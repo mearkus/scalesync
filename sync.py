@@ -1,8 +1,8 @@
 """
-scalesync: Wyze Scale → Garmin Connect
+scalesync: Wyze Scale -> Garmin Connect
 
 Fetches all available body composition records from a Wyze Scale and
-uploads any not-yet-synced measurements to Garmin Connect as FIT files.
+uploads any not-yet-synced measurements to Garmin Connect.
 
 Required environment variables:
   WYZE_EMAIL, WYZE_PASSWORD, WYZE_KEY_ID, WYZE_API_KEY
@@ -12,22 +12,19 @@ Optional:
   SYNC_INTERVAL  - minutes between sync runs (default: 30)
   DATA_DIR       - directory for persistent state (default: /data)
   DRY_RUN        - when "true" (default), authenticate both services but skip
-                   the actual Garmin upload; log all Wyze data and the FIT file
-                   that would have been sent. Set to "false" to enable uploads.
+                   the actual Garmin write; log all Wyze data that would have
+                   been sent. Set to "false" to enable uploads.
 """
 
 import hashlib
-import io
 import logging
 import os
 import time
 from datetime import datetime, timedelta
 
-import garth
+from garminconnect import Garmin
 from wyze_sdk import Client
 from wyze_sdk.errors import WyzeApiError
-
-from fit import FitEncoder_Weight
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,14 +32,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
-
-class NamedBytesIO(io.BytesIO):
-    """BytesIO wrapper that provides a filename for garth uploads."""
-
-    def __init__(self, data: bytes, name: str):
-        super().__init__(data)
-        self.name = name
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -65,14 +54,6 @@ SYNCED_FILE = os.path.join(DATA_DIR, "synced.txt")
 
 # Wyze weight is reported in lbs; Garmin requires kg
 LBS_TO_KG = 0.45359237
-# Newer/unknown Wyze scale variants may come through as product_type="Common"
-# until wyze-sdk adds explicit mappings.
-KNOWN_WYZE_SCALE_MODELS = {
-    "WL_SC2",
-    "WL_SCA",
-    "WL_SCL",
-    "WL_SCU",
-}
 
 # Newer/unknown Wyze scale variants may come through as product_type="Common"
 # until wyze-sdk adds explicit mappings.
@@ -88,25 +69,23 @@ KNOWN_WYZE_SCALE_MODELS = {
 # Garmin authentication
 # ---------------------------------------------------------------------------
 
-def garmin_auth():
-    """Authenticate with Garmin Connect, persisting OAuth tokens to disk."""
+def garmin_auth() -> Garmin:
+    """Authenticate with Garmin Connect and return a logged-in client."""
     os.makedirs(GARMIN_TOKENS_DIR, exist_ok=True)
     try:
-        garth.resume(GARMIN_TOKENS_DIR)
-        garth.client.username  # verify token is usable
-        log.info("Resumed Garmin session from saved tokens.")
-    except Exception:
-        log.info("No valid saved tokens — logging in to Garmin Connect.")
-        garth.login(GARMIN_EMAIL, GARMIN_PASSWORD)
-        garth.save(GARMIN_TOKENS_DIR)
-        log.info("Garmin tokens saved to %s", GARMIN_TOKENS_DIR)
+        client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
+        client.login(tokenstore=GARMIN_TOKENS_DIR)
+        log.info("Garmin authentication successful.")
+        return client
+    except Exception as exc:
+        raise RuntimeError(f"Garmin authentication failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
 # Wyze authentication
 # ---------------------------------------------------------------------------
 
-def wyze_auth():
+def wyze_auth() -> str:
     """Authenticate with Wyze and return an access token."""
     try:
         response = Client().login(
@@ -129,78 +108,64 @@ def wyze_auth():
 # ---------------------------------------------------------------------------
 
 def load_synced() -> set:
-    """Load the set of already-synced FIT file checksums."""
+    """Load the set of already-synced record checksums."""
     if not os.path.exists(SYNCED_FILE):
         return set()
-    with open(SYNCED_FILE) as f:
+    with open(SYNCED_FILE, encoding="utf-8") as f:
         return {line.strip() for line in f if line.strip()}
 
 
-def mark_synced(checksum: str):
+def mark_synced(checksum: str) -> None:
     """Append a checksum to the synced file."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(SYNCED_FILE, "a") as f:
+    with open(SYNCED_FILE, "a", encoding="utf-8") as f:
         f.write(checksum + "\n")
 
 
 # ---------------------------------------------------------------------------
-# FIT file building
+# Record helpers
 # ---------------------------------------------------------------------------
 
-def build_fit(record) -> bytes:
-    """Convert a Wyze ScaleRecord into a FIT file (bytes)."""
-    timestamp_s = int(record.measure_ts) // 1000
+def _float(val):
+    return float(val) if val is not None else None
 
-    weight_kg = float(record.weight) * LBS_TO_KG if record.weight is not None else None
 
-    def _float(val):
-        return float(val) if val is not None else None
+def _int(val):
+    return int(val) if val is not None else None
 
-    def _int(val):
-        return int(val) if val is not None else None
 
-    body_fat = _float(record.body_fat)
-    body_water = _float(record.body_water)
-    body_vfr = _float(record.body_vfr)
-    bone_mineral = _float(record.bone_mineral)
-    muscle = _float(record.muscle)
+def _record_payload(record) -> dict:
+    """Map a Wyze record to python-garminconnect add_body_composition fields."""
+    weight_kg = _float(record.weight) * LBS_TO_KG if record.weight is not None else None
     bmr = _float(getattr(record, "bmr", None))
-    metabolic_age = _int(getattr(record, "metabolic_age", None))
-    body_type = _int(getattr(record, "body_type", None)) or 5
-    bmi = _float(record.bmi)
+    body_vfr = _float(record.body_vfr)
+    timestamp = datetime.utcfromtimestamp(int(record.measure_ts) / 1000).isoformat(timespec="milliseconds")
 
-    basal_met = _int(bmr) if bmr is not None else None
-    active_met = int(bmr * 1.25) if bmr is not None else None
-
-    # Approximate visceral fat mass from visceral fat rating (1 rating ≈ 1 unit)
-    visceral_fat_mass = body_vfr
-
-    enc = FitEncoder_Weight()
-    enc.write_file_info(time_created=timestamp_s)
-    enc.write_file_creator()
-    enc.write_device_info(timestamp=timestamp_s)
-    enc.write_weight_scale(
-        timestamp=timestamp_s,
-        weight=weight_kg,
-        percent_fat=body_fat,
-        percent_hydration=body_water,
-        visceral_fat_mass=visceral_fat_mass,
-        bone_mass=bone_mineral,
-        muscle_mass=muscle,
-        basal_met=basal_met,
-        physique_rating=body_type,
-        active_met=active_met,
-        metabolic_age=metabolic_age,
-        visceral_fat_rating=_int(body_vfr),
-        bmi=bmi,
-    )
-    return enc.finish()
+    return {
+        "timestamp": timestamp,
+        "weight": weight_kg,
+        "percent_fat": _float(record.body_fat),
+        "percent_hydration": _float(record.body_water),
+        "visceral_fat_mass": body_vfr,
+        "bone_mass": _float(record.bone_mineral),
+        "muscle_mass": _float(record.muscle),
+        "basal_met": _int(bmr) if bmr is not None else None,
+        "active_met": int(bmr * 1.25) if bmr is not None else None,
+        "physique_rating": _int(getattr(record, "body_type", None)) or 5,
+        "metabolic_age": _int(getattr(record, "metabolic_age", None)),
+        "visceral_fat_rating": _int(body_vfr),
+        "bmi": _float(record.bmi),
+    }
 
 
-def log_wyze_record(record, fit_bytes: bytes):
-    """Log full details of a Wyze record and the FIT file that would be uploaded."""
-    checksum = hashlib.md5(fit_bytes).hexdigest()
-    weight_lbs = float(record.weight) if record.weight is not None else None
+def checksum_payload(payload: dict) -> str:
+    canonical = "|".join(str(payload[k]) for k in sorted(payload.keys()))
+    return hashlib.md5(canonical.encode("utf-8")).hexdigest()
+
+
+def log_wyze_record(record, checksum: str) -> None:
+    """Log details of a Wyze record that would be uploaded."""
+    weight_lbs = _float(record.weight)
     weight_kg = weight_lbs * LBS_TO_KG if weight_lbs is not None else None
     log.info(
         "[DRY-RUN] Wyze record details: "
@@ -220,18 +185,14 @@ def log_wyze_record(record, fit_bytes: bytes):
         getattr(record, "metabolic_age", None),
         getattr(record, "body_type", None),
     )
-    log.info(
-        "[DRY-RUN] FIT file that would be uploaded: md5=%s  size=%d bytes",
-        checksum,
-        len(fit_bytes),
-    )
+    log.info("[DRY-RUN] Upload payload checksum: md5=%s", checksum)
 
 
 # ---------------------------------------------------------------------------
 # Main sync
 # ---------------------------------------------------------------------------
 
-def sync_once():
+def sync_once() -> None:
     """Run one sync cycle: fetch Wyze records, upload new ones to Garmin."""
     log.info("--- Starting sync (DRY_RUN=%s) ---", DRY_RUN)
     uploaded = 0
@@ -240,7 +201,7 @@ def sync_once():
 
     # Authenticate both services regardless of dry-run mode
     access_token = wyze_auth()
-    garmin_auth()
+    garmin_client = garmin_auth()
 
     synced = load_synced()
 
@@ -345,36 +306,32 @@ def sync_once():
         log.info("Found %d record(s) for this scale.", len(records))
 
         for record in records:
-            try:
-                fit_bytes = build_fit(record)
-            except Exception as exc:
-                log.error("Failed to build FIT for record ts=%s: %s", record.measure_ts, exc)
-                continue
-
-            checksum = hashlib.md5(fit_bytes).hexdigest()
+            payload = _record_payload(record)
+            checksum = checksum_payload(payload)
 
             if checksum in synced:
                 skipped += 1
                 continue
 
             if DRY_RUN:
-                log_wyze_record(record, fit_bytes)
+                log_wyze_record(record, checksum)
                 dry_run_logged += 1
                 continue
 
+            if payload["weight"] is None:
+                log.warning("Skipping record ts=%s: no weight value.", record.measure_ts)
+                continue
+
             try:
-                fit_stream = NamedBytesIO(
-                    fit_bytes,
-                    f"wyze-scale-{int(record.measure_ts)}.fit",
-                )
-                garth.client.upload(fit_stream)
+                body_kwargs = {k: v for k, v in payload.items() if v is not None}
+                garmin_client.add_body_composition(**body_kwargs)
                 mark_synced(checksum)
                 synced.add(checksum)
                 uploaded += 1
                 log.info(
                     "Uploaded: ts=%s  weight=%.1f lbs",
                     record.measure_ts,
-                    float(record.weight) if record.weight else 0,
+                    _float(record.weight) if record.weight else 0,
                 )
             except Exception as exc:
                 log.error("Failed to upload record ts=%s: %s", record.measure_ts, exc)
@@ -389,7 +346,7 @@ def sync_once():
         log.info("Sync complete: %d uploaded, %d already synced.", uploaded, skipped)
 
 
-def main():
+def main() -> None:
     log.info("scalesync starting. Sync interval: %d minutes.", SYNC_INTERVAL)
     while True:
         try:
