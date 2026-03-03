@@ -36,6 +36,14 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+class NamedBytesIO(io.BytesIO):
+    """BytesIO wrapper that provides a filename for garth uploads."""
+
+    def __init__(self, data: bytes, name: str):
+        super().__init__(data)
+        self.name = name
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -355,7 +363,11 @@ def sync_once():
                 continue
 
             try:
-                garth.client.upload(io.BytesIO(fit_bytes))
+                fit_stream = NamedBytesIO(
+                    fit_bytes,
+                    f"wyze-scale-{int(record.measure_ts)}.fit",
+                )
+                garth.client.upload(fit_stream)
                 mark_synced(checksum)
                 synced.add(checksum)
                 uploaded += 1
