@@ -56,6 +56,14 @@ SYNCED_FILE = os.path.join(DATA_DIR, "synced.txt")
 
 # Wyze weight is reported in lbs; Garmin requires kg
 LBS_TO_KG = 0.45359237
+# Newer/unknown Wyze scale variants may come through as product_type="Common"
+# until wyze-sdk adds explicit mappings.
+KNOWN_WYZE_SCALE_MODELS = {
+    "WL_SC2",
+    "WL_SCA",
+    "WL_SCL",
+    "WL_SCU",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +231,30 @@ def sync_once():
     devices = client.devices_list()
     log.info("Wyze devices found: %d total", len(devices))
 
-    scale_devices = [d for d in devices if d.type == "WyzeScale"]
+    def _is_scale_device(device) -> bool:
+        device_type = getattr(device, "type", "")
+        if device_type == "WyzeScale":
+            return True
+
+        product_model = (getattr(device, "product_model", "") or "").upper()
+        product_type = (getattr(device, "product_type", "") or "").lower()
+        mac = (getattr(device, "mac", "") or "").upper()
+        nickname = (getattr(device, "nickname", "") or "").lower()
+
+        if product_model in KNOWN_WYZE_SCALE_MODELS:
+            return True
+        if product_model.startswith("WL_SC"):
+            return True
+        if product_type == "scale":
+            return True
+        if mac.startswith("WL_SC"):
+            return True
+        if "scale" in nickname:
+            return True
+
+        return False
+
+    scale_devices = [d for d in devices if _is_scale_device(d)]
 
     if not scale_devices:
         log.warning("No Wyze Scale devices found on this account.")
@@ -235,6 +266,10 @@ def sync_once():
             scale = client.scales.info(device_mac=device.mac)
         except WyzeApiError as exc:
             log.error("Failed to fetch scale info for %s: %s", device.mac, exc)
+            continue
+
+        if scale is None:
+            log.warning("Wyze returned no scale info for %s; skipping this device.", device.mac)
             continue
 
         records = scale.latest_records or []
