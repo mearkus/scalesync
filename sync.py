@@ -240,6 +240,7 @@ def sync_once():
         product_model = (getattr(device, "product_model", "") or "").upper()
         product_type = (getattr(device, "product_type", "") or "").lower()
         mac = (getattr(device, "mac", "") or "").upper()
+        nickname = (getattr(device, "nickname", "") or "").lower()
 
         if product_model in KNOWN_WYZE_SCALE_MODELS:
             return True
@@ -249,12 +250,25 @@ def sync_once():
             return True
         if mac.startswith("WL_SC"):
             return True
+        if "scale" in nickname:
+            return True
 
         return False
 
     scale_devices = [d for d in devices if _is_scale_device(d)]
 
     if not scale_devices:
+        # Helpful diagnostics when wyze-sdk labels devices as Unknown.
+        for device in devices:
+            log.warning(
+                "Device rejected by scale filter: type=%s product_model=%s "
+                "product_type=%s mac=%s nickname=%s",
+                getattr(device, "type", None),
+                getattr(device, "product_model", None),
+                getattr(device, "product_type", None),
+                getattr(device, "mac", None),
+                getattr(device, "nickname", None),
+            )
         log.warning("No Wyze Scale devices found on this account.")
         return
 
