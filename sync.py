@@ -222,6 +222,7 @@ def sync_once():
     client = Client(token=access_token)
     devices = client.devices_list()
     log.info("Wyze devices found: %d total", len(devices))
+
     scale_devices = [d for d in devices if d.type == "WyzeScale"]
 
     if not scale_devices:
