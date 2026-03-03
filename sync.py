@@ -1,5 +1,5 @@
 """
-Scalesync: Wyze Scale → Garmin Connect
+scalesync: Wyze Scale → Garmin Connect
 
 Fetches all available body composition records from a Wyze Scale and
 uploads any not-yet-synced measurements to Garmin Connect as FIT files.
@@ -233,7 +233,7 @@ def sync_once():
 
 
 def main():
-    log.info("Scalesync starting. Sync interval: %d minutes.", SYNC_INTERVAL)
+    log.info("scalesync starting. Sync interval: %d minutes.", SYNC_INTERVAL)
     while True:
         try:
             sync_once()
