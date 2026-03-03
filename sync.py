@@ -186,7 +186,11 @@ def sync_once():
     # Connect to Wyze and find scale devices
     client = Client(token=access_token)
     devices = client.devices_list()
-    scale_devices = [d for d in devices if d.type == "WyzeScale"]
+    log.info("Wyze devices found: %d total", len(devices))
+    scale_devices = [
+        d for d in devices
+        if d.type == "WyzeScale" or getattr(d, "product_model", "") == "WL_SCU"
+    ]
 
     if not scale_devices:
         log.warning("No Wyze Scale devices found on this account.")
