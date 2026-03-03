@@ -1,2 +1,2 @@
 wyze-sdk
-python-garminconnect
+garminconnect
