@@ -13,3 +13,4 @@ services:
       - GARMIN_PASSWORD=${GARMIN_PASSWORD}
       - SYNC_INTERVAL=${SYNC_INTERVAL:-30}
       - DATA_DIR=/data
+      - DRY_RUN=${DRY_RUN:-true}
