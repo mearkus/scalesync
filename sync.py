@@ -21,6 +21,7 @@ import io
 import logging
 import os
 import time
+from datetime import datetime, timedelta
 
 import garth
 from wyze_sdk import Client
@@ -262,17 +263,57 @@ def sync_once():
 
     for device in scale_devices:
         log.info("Processing scale: %s (%s)", device.nickname or device.mac, device.mac)
+        records = []
+
         try:
             scale = client.scales.info(device_mac=device.mac)
         except WyzeApiError as exc:
             log.error("Failed to fetch scale info for %s: %s", device.mac, exc)
-            continue
+            scale = None
 
         if scale is None:
-            log.warning("Wyze returned no scale info for %s; skipping this device.", device.mac)
-            continue
+            log.warning("Wyze returned no scale info for %s; trying get_records fallback.", device.mac)
+        else:
+            records = scale.latest_records or []
 
-        records = scale.latest_records or []
+        # Some models are not supported by scales.info() but still expose
+        # measurement history via get_records().
+        if not records:
+            get_records = getattr(client.scales, "get_records", None)
+            if callable(get_records):
+                end_time = datetime.utcnow()
+                start_time = end_time - timedelta(days=3650)
+
+                model_candidates = []
+                product_model = (getattr(device, "product_model", "") or "").strip()
+                if product_model:
+                    model_candidates.append(product_model)
+                model_candidates.extend(["JA.SC", "JA.SC2"])
+
+                for model in model_candidates:
+                    try:
+                        fallback_records = get_records(
+                            device_model=model,
+                            start_time=start_time,
+                            end_time=end_time,
+                        )
+                        if fallback_records:
+                            records = list(fallback_records)
+                            log.info(
+                                "Found %d record(s) via get_records fallback (device_model=%s).",
+                                len(records),
+                                model,
+                            )
+                            break
+                    except Exception as exc:
+                        log.warning(
+                            "get_records fallback failed for device_model=%s: %s",
+                            model,
+                            exc,
+                        )
+            else:
+                log.warning("wyze-sdk has no scales.get_records() method; cannot use fallback.")
+
         log.info("Found %d record(s) for this scale.", len(records))
 
         for record in records:
