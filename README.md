@@ -15,7 +15,7 @@ Supports two deployment modes:
 
 1. Authenticates with the Wyze API and fetches all scale records.
 2. Maps each measurement to Garmin body-composition fields.
-3. Uploads each measurement to Garmin Connect via `python-garminconnect`.
+3. Uploads each measurement to Garmin Connect via `garminconnect`.
 4. Tracks uploaded checksums in `data/synced.txt` so nothing is uploaded twice.
 
 ---
