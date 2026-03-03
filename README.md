@@ -1,4 +1,4 @@
-# Scalesync
+# scalesync
 
 Syncs body-composition measurements from a **Wyze Scale** to **Garmin Connect** as FIT files.
 
