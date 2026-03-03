@@ -46,5 +46,7 @@ jobs:
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
           # Point state files at the cached data directory
           DATA_DIR: data
+          # Set DRY_RUN=false in repository secrets/vars to enable real uploads.
+          DRY_RUN: ${{ vars.DRY_RUN || 'true' }}
         # Call sync_once() directly — no infinite loop needed in CI.
         run: python -c "from sync import sync_once; sync_once()"

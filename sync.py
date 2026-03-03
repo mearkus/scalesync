@@ -11,6 +11,9 @@ Required environment variables:
 Optional:
   SYNC_INTERVAL  - minutes between sync runs (default: 30)
   DATA_DIR       - directory for persistent state (default: /data)
+  DRY_RUN        - when "true" (default), authenticate both services but skip
+                   the actual Garmin upload; log all Wyze data and the FIT file
+                   that would have been sent. Set to "false" to enable uploads.
 """
 
 import hashlib
@@ -46,6 +49,7 @@ GARMIN_PASSWORD = os.environ["GARMIN_PASSWORD"]
 
 SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "30"))
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
+DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
 
 GARMIN_TOKENS_DIR = os.path.join(DATA_DIR, "garmin_tokens")
 SYNCED_FILE = os.path.join(DATA_DIR, "synced.txt")
@@ -167,17 +171,48 @@ def build_fit(record) -> bytes:
     return enc.finish()
 
 
+def log_wyze_record(record, fit_bytes: bytes):
+    """Log full details of a Wyze record and the FIT file that would be uploaded."""
+    checksum = hashlib.md5(fit_bytes).hexdigest()
+    weight_lbs = float(record.weight) if record.weight is not None else None
+    weight_kg = weight_lbs * LBS_TO_KG if weight_lbs is not None else None
+    log.info(
+        "[DRY-RUN] Wyze record details: "
+        "ts=%s  weight=%.1f lbs (%.3f kg)  body_fat=%s%%  body_water=%s%%  "
+        "bmi=%s  muscle=%s  bone_mineral=%s  body_vfr=%s  bmr=%s  "
+        "metabolic_age=%s  body_type=%s",
+        record.measure_ts,
+        weight_lbs or 0,
+        weight_kg or 0,
+        getattr(record, "body_fat", None),
+        getattr(record, "body_water", None),
+        getattr(record, "bmi", None),
+        getattr(record, "muscle", None),
+        getattr(record, "bone_mineral", None),
+        getattr(record, "body_vfr", None),
+        getattr(record, "bmr", None),
+        getattr(record, "metabolic_age", None),
+        getattr(record, "body_type", None),
+    )
+    log.info(
+        "[DRY-RUN] FIT file that would be uploaded: md5=%s  size=%d bytes",
+        checksum,
+        len(fit_bytes),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main sync
 # ---------------------------------------------------------------------------
 
 def sync_once():
     """Run one sync cycle: fetch Wyze records, upload new ones to Garmin."""
-    log.info("--- Starting sync ---")
+    log.info("--- Starting sync (DRY_RUN=%s) ---", DRY_RUN)
     uploaded = 0
     skipped = 0
+    dry_run_logged = 0
 
-    # Authenticate
+    # Authenticate both services regardless of dry-run mode
     access_token = wyze_auth()
     garmin_auth()
 
@@ -186,6 +221,7 @@ def sync_once():
     # Connect to Wyze and find scale devices
     client = Client(token=access_token)
     devices = client.devices_list()
+    log.info("Wyze devices found: %d total", len(devices))
     scale_devices = [d for d in devices if d.type == "WyzeScale"]
 
     if not scale_devices:
@@ -216,6 +252,11 @@ def sync_once():
                 skipped += 1
                 continue
 
+            if DRY_RUN:
+                log_wyze_record(record, fit_bytes)
+                dry_run_logged += 1
+                continue
+
             try:
                 garth.client.upload(io.BytesIO(fit_bytes))
                 mark_synced(checksum)
@@ -229,7 +270,14 @@ def sync_once():
             except Exception as exc:
                 log.error("Failed to upload record ts=%s: %s", record.measure_ts, exc)
 
-    log.info("Sync complete: %d uploaded, %d already synced.", uploaded, skipped)
+    if DRY_RUN:
+        log.info(
+            "Sync complete (DRY-RUN): %d would-be uploads logged, %d already synced.",
+            dry_run_logged,
+            skipped,
+        )
+    else:
+        log.info("Sync complete: %d uploaded, %d already synced.", uploaded, skipped)
 
 
 def main():
