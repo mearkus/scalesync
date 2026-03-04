@@ -7,9 +7,17 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Set false to upload to Garmin"
+        description: "Set true to skip Garmin uploads"
         required: false
-        default: "true"
+        default: "false"
+      date_from:
+        description: "Optional start date (YYYY-MM-DD)"
+        required: false
+        default: ""
+      date_to:
+        description: "Optional end date (YYYY-MM-DD)"
+        required: false
+        default: ""
 
 jobs:
   sync:
@@ -51,7 +59,9 @@ jobs:
           GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
           # Point state files at the cached data directory
           DATA_DIR: data
-          # Manual run input overrides repo variable; default remains true.
-          DRY_RUN: ${{ github.event.inputs.dry_run || vars.DRY_RUN || 'true' }}
+          # Manual run input overrides repo variable; default is live upload.
+          DRY_RUN: ${{ github.event.inputs.dry_run || vars.DRY_RUN || 'false' }}
+          DATE_FROM: ${{ github.event.inputs.date_from || vars.DATE_FROM || '' }}
+          DATE_TO: ${{ github.event.inputs.date_to || vars.DATE_TO || '' }}
         # Call sync_once() directly — no infinite loop needed in CI.
         run: python -c "from sync import sync_once; sync_once()"
