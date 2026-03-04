@@ -16,7 +16,8 @@ Supports two deployment modes:
 1. Authenticates with the Wyze API and fetches all scale records.
 2. Maps each measurement to Garmin body-composition fields.
 3. Uploads each measurement to Garmin Connect via `garminconnect`.
-4. Tracks uploaded checksums in `data/synced.txt` so nothing is uploaded twice.
+4. By default, syncs only records for the current date (or an optional date range).
+5. Tracks uploaded checksums in `data/synced.txt` so nothing is uploaded twice.
 
 ---
 
@@ -111,6 +112,9 @@ The container persists OAuth tokens and sync state in `./data/` on your host.
 |----------|---------|-------------|
 | `SYNC_INTERVAL` | `30` | Minutes between sync runs |
 | `DATA_DIR` | `/data` | Where to store tokens and synced.txt |
+| `DRY_RUN` | `false` | Set `true` to log only and skip Garmin uploads |
+| `DATE_FROM` | *(today)* | Optional start date (`YYYY-MM-DD`) |
+| `DATE_TO` | *(today)* | Optional end date (`YYYY-MM-DD`) |
 
 ---
 

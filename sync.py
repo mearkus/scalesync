@@ -11,16 +11,18 @@ Required environment variables:
 Optional:
   SYNC_INTERVAL  - minutes between sync runs (default: 30)
   DATA_DIR       - directory for persistent state (default: /data)
-  DRY_RUN        - when "true" (default), authenticate both services but skip
-                   the actual Garmin write; log all Wyze data that would have
-                   been sent. Set to "false" to enable uploads.
+  DRY_RUN        - when "true", authenticate both services but skip uploads.
+                   Default is "false" (live uploads enabled).
+  DATE_FROM      - optional start date (YYYY-MM-DD) for backfill runs.
+  DATE_TO        - optional end date (YYYY-MM-DD) for backfill runs.
+                   If no date range is provided, only today's records are synced.
 """
 
 import hashlib
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from garminconnect import Garmin
 from wyze_sdk import Client
@@ -47,7 +49,9 @@ GARMIN_PASSWORD = os.environ["GARMIN_PASSWORD"]
 
 SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "30"))
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
-DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() != "false"
+DRY_RUN = os.environ.get("DRY_RUN", "false").strip().lower() == "true"
+DATE_FROM = os.environ.get("DATE_FROM", "").strip()
+DATE_TO = os.environ.get("DATE_TO", "").strip()
 
 GARMIN_TOKENS_DIR = os.path.join(DATA_DIR, "garmin_tokens")
 SYNCED_FILE = os.path.join(DATA_DIR, "synced.txt")
@@ -63,6 +67,30 @@ KNOWN_WYZE_SCALE_MODELS = {
     "WL_SCL",
     "WL_SCU",
 }
+
+
+def resolve_date_range() -> tuple[date, date]:
+    """Resolve desired sync date range from env, defaulting to today."""
+    if not DATE_FROM and not DATE_TO:
+        today = datetime.now().date()
+        return today, today
+
+    if DATE_FROM:
+        start = datetime.strptime(DATE_FROM, "%Y-%m-%d").date()
+    elif DATE_TO:
+        start = datetime.strptime(DATE_TO, "%Y-%m-%d").date()
+    else:
+        raise RuntimeError("Unreachable date range parsing branch.")
+
+    if DATE_TO:
+        end = datetime.strptime(DATE_TO, "%Y-%m-%d").date()
+    else:
+        end = start
+
+    if start > end:
+        raise ValueError(f"DATE_FROM ({start}) cannot be after DATE_TO ({end}).")
+
+    return start, end
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +226,8 @@ def sync_once() -> None:
     uploaded = 0
     skipped = 0
     dry_run_logged = 0
+    window_start, window_end = resolve_date_range()
+    log.info("Sync date window: %s to %s", window_start, window_end)
 
     # Authenticate both services regardless of dry-run mode
     access_token = wyze_auth()
@@ -270,8 +300,8 @@ def sync_once() -> None:
         if not records:
             get_records = getattr(client.scales, "get_records", None)
             if callable(get_records):
-                end_time = datetime.utcnow()
-                start_time = end_time - timedelta(days=3650)
+                start_time = datetime.combine(window_start, datetime.min.time())
+                end_time = datetime.combine(window_end + timedelta(days=1), datetime.min.time())
 
                 model_candidates = []
                 product_model = (getattr(device, "product_model", "") or "").strip()
@@ -304,6 +334,14 @@ def sync_once() -> None:
                 log.warning("wyze-sdk has no scales.get_records() method; cannot use fallback.")
 
         log.info("Found %d record(s) for this scale.", len(records))
+
+        filtered_records = []
+        for record in records:
+            record_date = datetime.utcfromtimestamp(int(record.measure_ts) / 1000).date()
+            if window_start <= record_date <= window_end:
+                filtered_records.append(record)
+        records = filtered_records
+        log.info("Found %d record(s) in selected date window.", len(records))
 
         for record in records:
             payload = _record_payload(record)
