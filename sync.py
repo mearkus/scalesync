@@ -22,7 +22,7 @@ import hashlib
 import logging
 import os
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from garminconnect import Garmin
 from wyze_sdk import Client
@@ -47,8 +47,16 @@ WYZE_API_KEY = os.environ["WYZE_API_KEY"]
 GARMIN_EMAIL = os.environ["GARMIN_EMAIL"]
 GARMIN_PASSWORD = os.environ["GARMIN_PASSWORD"]
 
-SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "30"))
-DATA_DIR = os.environ.get("DATA_DIR", "/data")
+_sync_interval_raw = os.environ.get("SYNC_INTERVAL", "30")
+try:
+    SYNC_INTERVAL = int(_sync_interval_raw)
+except ValueError:
+    raise ValueError(f"SYNC_INTERVAL must be an integer, got: {_sync_interval_raw!r}")
+if not (1 <= SYNC_INTERVAL <= 1440):
+    raise ValueError(f"SYNC_INTERVAL must be between 1 and 1440 minutes, got: {SYNC_INTERVAL}")
+
+_data_dir_raw = os.environ.get("DATA_DIR", "/data")
+DATA_DIR = os.path.realpath(os.path.abspath(_data_dir_raw))
 DRY_RUN = os.environ.get("DRY_RUN", "false").strip().lower() == "true"
 DATE_FROM = os.environ.get("DATE_FROM", "").strip()
 DATE_TO = os.environ.get("DATE_TO", "").strip()
@@ -75,17 +83,20 @@ def resolve_date_range() -> tuple[date, date]:
         today = datetime.now().date()
         return today, today
 
-    if DATE_FROM:
-        start = datetime.strptime(DATE_FROM, "%Y-%m-%d").date()
-    elif DATE_TO:
-        start = datetime.strptime(DATE_TO, "%Y-%m-%d").date()
-    else:
-        raise RuntimeError("Unreachable date range parsing branch.")
+    try:
+        if DATE_FROM:
+            start = datetime.strptime(DATE_FROM, "%Y-%m-%d").date()
+        elif DATE_TO:
+            start = datetime.strptime(DATE_TO, "%Y-%m-%d").date()
+        else:
+            raise RuntimeError("Unreachable date range parsing branch.")
 
-    if DATE_TO:
-        end = datetime.strptime(DATE_TO, "%Y-%m-%d").date()
-    else:
-        end = start
+        if DATE_TO:
+            end = datetime.strptime(DATE_TO, "%Y-%m-%d").date()
+        else:
+            end = start
+    except ValueError as exc:
+        raise ValueError(f"Invalid date format (expected YYYY-MM-DD): {exc}") from exc
 
     if start > end:
         raise ValueError(f"DATE_FROM ({start}) cannot be after DATE_TO ({end}).")
@@ -100,6 +111,7 @@ def resolve_date_range() -> tuple[date, date]:
 def garmin_auth() -> Garmin:
     """Authenticate with Garmin Connect and return a logged-in client."""
     os.makedirs(GARMIN_TOKENS_DIR, exist_ok=True)
+    os.chmod(GARMIN_TOKENS_DIR, 0o700)
     try:
         client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
         client.login(tokenstore=GARMIN_TOKENS_DIR)
@@ -137,10 +149,11 @@ def wyze_auth() -> str:
 
 def load_synced() -> set:
     """Load the set of already-synced record checksums."""
-    if not os.path.exists(SYNCED_FILE):
+    try:
+        with open(SYNCED_FILE, encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+    except FileNotFoundError:
         return set()
-    with open(SYNCED_FILE, encoding="utf-8") as f:
-        return {line.strip() for line in f if line.strip()}
 
 
 def mark_synced(checksum: str) -> None:
@@ -167,7 +180,7 @@ def _record_payload(record) -> dict:
     weight_kg = _float(record.weight) * LBS_TO_KG if record.weight is not None else None
     bmr = _float(getattr(record, "bmr", None))
     body_vfr = _float(record.body_vfr)
-    timestamp = datetime.utcfromtimestamp(int(record.measure_ts) / 1000).isoformat(timespec="milliseconds")
+    timestamp = datetime.fromtimestamp(int(record.measure_ts) / 1000, tz=timezone.utc).isoformat(timespec="milliseconds")
 
     return {
         "timestamp": timestamp,
@@ -188,7 +201,7 @@ def _record_payload(record) -> dict:
 
 def checksum_payload(payload: dict) -> str:
     canonical = "|".join(str(payload[k]) for k in sorted(payload.keys()))
-    return hashlib.md5(canonical.encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def log_wyze_record(record, checksum: str) -> None:
@@ -213,7 +226,7 @@ def log_wyze_record(record, checksum: str) -> None:
         getattr(record, "metabolic_age", None),
         getattr(record, "body_type", None),
     )
-    log.info("[DRY-RUN] Upload payload checksum: md5=%s", checksum)
+    log.info("[DRY-RUN] Upload payload checksum: sha256=%s", checksum)
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +350,7 @@ def sync_once() -> None:
 
         filtered_records = []
         for record in records:
-            record_date = datetime.utcfromtimestamp(int(record.measure_ts) / 1000).date()
+            record_date = datetime.fromtimestamp(int(record.measure_ts) / 1000, tz=timezone.utc).date()
             if window_start <= record_date <= window_end:
                 filtered_records.append(record)
         records = filtered_records
