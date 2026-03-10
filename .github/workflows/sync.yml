@@ -49,6 +49,25 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Validate inputs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          DRY_RUN_VAL="${{ github.event.inputs.dry_run }}"
+          DATE_FROM_VAL="${{ github.event.inputs.date_from }}"
+          DATE_TO_VAL="${{ github.event.inputs.date_to }}"
+          if [[ -n "$DRY_RUN_VAL" && "$DRY_RUN_VAL" != "true" && "$DRY_RUN_VAL" != "false" ]]; then
+            echo "ERROR: dry_run must be 'true' or 'false', got: $DRY_RUN_VAL"
+            exit 1
+          fi
+          if [[ -n "$DATE_FROM_VAL" && ! "$DATE_FROM_VAL" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "ERROR: date_from must be YYYY-MM-DD, got: $DATE_FROM_VAL"
+            exit 1
+          fi
+          if [[ -n "$DATE_TO_VAL" && ! "$DATE_TO_VAL" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "ERROR: date_to must be YYYY-MM-DD, got: $DATE_TO_VAL"
+            exit 1
+          fi
+
       - name: Run sync
         env:
           WYZE_EMAIL:    ${{ secrets.WYZE_EMAIL }}
