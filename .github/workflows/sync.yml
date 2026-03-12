@@ -1,9 +1,12 @@
 name: Sync Wyze Scale → Garmin Connect
 
-# Runs every 6 hours automatically, or trigger manually from the Actions tab.
+# Runs at 7:00 AM Central time daily.
+# Two entries cover both standard time (CST = UTC-6 → 13:00 UTC)
+# and daylight time (CDT = UTC-5 → 12:00 UTC).
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 13 * * *"  # 7:00 AM CST (Nov–Mar)
+    - cron: "0 12 * * *"  # 7:00 AM CDT (Mar–Nov)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -23,7 +26,7 @@ jobs:
   sync:
     name: Sync scale data
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
@@ -82,5 +85,23 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run || vars.DRY_RUN || 'false' }}
           DATE_FROM: ${{ github.event.inputs.date_from || vars.DATE_FROM || '' }}
           DATE_TO: ${{ github.event.inputs.date_to || vars.DATE_TO || '' }}
-        # Call sync_once() directly — no infinite loop needed in CI.
-        run: python -c "from sync import sync_once; sync_once()"
+        # Run sync; if nothing uploaded, retry every 5 min for up to 30 min.
+        run: |
+          python - <<'EOF'
+          import time
+          from sync import sync_once
+
+          RETRY_INTERVAL_SEC = 300  # 5 minutes
+          MAX_RETRIES = 6           # 30 minutes total
+
+          if sync_once() > 0:
+              raise SystemExit(0)
+
+          for attempt in range(1, MAX_RETRIES + 1):
+              print(f"No records uploaded. Waiting 5 minutes before retry {attempt}/{MAX_RETRIES}...")
+              time.sleep(RETRY_INTERVAL_SEC)
+              if sync_once() > 0:
+                  raise SystemExit(0)
+
+          print("No records found after 30 minutes of retries.")
+          EOF

@@ -233,7 +233,7 @@ def log_wyze_record(record, checksum: str) -> None:
 # Main sync
 # ---------------------------------------------------------------------------
 
-def sync_once() -> None:
+def sync_once() -> int:
     """Run one sync cycle: fetch Wyze records, upload new ones to Garmin."""
     log.info("--- Starting sync (DRY_RUN=%s) ---", DRY_RUN)
     uploaded = 0
@@ -393,8 +393,10 @@ def sync_once() -> None:
             dry_run_logged,
             skipped,
         )
+        return dry_run_logged
     else:
         log.info("Sync complete: %d uploaded, %d already synced.", uploaded, skipped)
+        return uploaded
 
 
 def main() -> None:
