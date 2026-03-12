@@ -291,7 +291,7 @@ def sync_once() -> int:
                 getattr(device, "nickname", None),
             )
         log.warning("No Wyze Scale devices found on this account.")
-        return
+        return 0
 
     for device in scale_devices:
         log.info("Processing scale: %s (%s)", device.nickname or device.mac, device.mac)
