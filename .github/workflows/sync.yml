@@ -84,22 +84,26 @@ jobs:
           DRY_RUN: ${{ github.event.inputs.dry_run || vars.DRY_RUN || 'false' }}
           DATE_FROM: ${{ github.event.inputs.date_from || vars.DATE_FROM || '' }}
           DATE_TO: ${{ github.event.inputs.date_to || vars.DATE_TO || '' }}
-        # Run sync; if nothing uploaded, retry every 5 min for up to 30 min.
+        # Authenticate once, then retry the sync every 5 min for up to 30 min.
+        # Reusing clients avoids repeated auth calls that can trigger rate limits.
         run: |
           python - <<'EOF'
           import time
-          from sync import sync_once
+          from sync import sync_once, wyze_auth, garmin_auth
 
           RETRY_INTERVAL_SEC = 300  # 5 minutes
           MAX_RETRIES = 6           # 30 minutes total
 
-          if sync_once() > 0:
+          wyze_token = wyze_auth()
+          garmin_client = garmin_auth()
+
+          if sync_once(wyze_token, garmin_client) > 0:
               raise SystemExit(0)
 
           for attempt in range(1, MAX_RETRIES + 1):
               print(f"No records uploaded. Waiting 5 minutes before retry {attempt}/{MAX_RETRIES}...")
               time.sleep(RETRY_INTERVAL_SEC)
-              if sync_once() > 0:
+              if sync_once(wyze_token, garmin_client) > 0:
                   raise SystemExit(0)
 
           print("No records found after 30 minutes of retries.")
