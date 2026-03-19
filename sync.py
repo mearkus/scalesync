@@ -21,6 +21,7 @@ Optional:
 import hashlib
 import logging
 import os
+import shutil
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -112,7 +113,7 @@ def garmin_auth() -> Garmin:
     """Authenticate with Garmin Connect and return a logged-in client."""
     os.makedirs(GARMIN_TOKENS_DIR, exist_ok=True)
     os.chmod(GARMIN_TOKENS_DIR, 0o700)
-    retry_delays = [30, 60, 120]
+    retry_delays = [60, 180, 300]
     for attempt, delay in enumerate(retry_delays + [None], start=1):
         try:
             client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
@@ -124,8 +125,16 @@ def garmin_auth() -> Garmin:
                 raise RuntimeError(
                     f"Garmin authentication rate-limited after {len(retry_delays) + 1} attempts: {exc}"
                 ) from exc
+            # Clear cached tokens so the next attempt does a fresh login
+            # instead of repeatedly trying to refresh expired tokens.
+            for entry in os.listdir(GARMIN_TOKENS_DIR):
+                path = os.path.join(GARMIN_TOKENS_DIR, entry)
+                if os.path.isfile(path):
+                    os.remove(path)
+                elif os.path.isdir(path):
+                    shutil.rmtree(path)
             log.warning(
-                "Garmin rate-limited on auth (attempt %d/%d); retrying in %ds...",
+                "Garmin rate-limited on auth (attempt %d/%d); cleared token cache, retrying in %ds...",
                 attempt, len(retry_delays) + 1, delay,
             )
             time.sleep(delay)
