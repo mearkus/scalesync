@@ -21,7 +21,6 @@ Optional:
 import hashlib
 import logging
 import os
-import shutil
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -110,34 +109,32 @@ def resolve_date_range() -> tuple[date, date]:
 # ---------------------------------------------------------------------------
 
 def garmin_auth() -> Garmin:
-    """Authenticate with Garmin Connect and return a logged-in client."""
+    """Authenticate with Garmin Connect and return a logged-in client.
+
+    On a 429 the rate limit window can exceed 30 minutes, so we make at most
+    two attempts (one retry after a 15-minute wait).  Keeping the number of
+    exchange-endpoint hits low is more effective than clearing the token cache
+    (a fresh login uses the same oauth/exchange endpoint as a token refresh).
+    """
     os.makedirs(GARMIN_TOKENS_DIR, exist_ok=True)
     os.chmod(GARMIN_TOKENS_DIR, 0o700)
-    retry_delays = [60, 180, 300]
-    for attempt, delay in enumerate(retry_delays + [None], start=1):
+    retry_delay = 900  # 15 minutes
+    for attempt in range(1, 3):
         try:
             client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
             client.login(tokenstore=GARMIN_TOKENS_DIR)
             log.info("Garmin authentication successful.")
             return client
         except GarminConnectTooManyRequestsError as exc:
-            if delay is None:
+            if attempt == 2:
                 raise RuntimeError(
-                    f"Garmin authentication rate-limited after {len(retry_delays) + 1} attempts: {exc}"
+                    f"Garmin authentication rate-limited after 2 attempts: {exc}"
                 ) from exc
-            # Clear cached tokens so the next attempt does a fresh login
-            # instead of repeatedly trying to refresh expired tokens.
-            for entry in os.listdir(GARMIN_TOKENS_DIR):
-                path = os.path.join(GARMIN_TOKENS_DIR, entry)
-                if os.path.isfile(path):
-                    os.remove(path)
-                elif os.path.isdir(path):
-                    shutil.rmtree(path)
             log.warning(
-                "Garmin rate-limited on auth (attempt %d/%d); cleared token cache, retrying in %ds...",
-                attempt, len(retry_delays) + 1, delay,
+                "Garmin rate-limited on auth (attempt 1/2); retrying in %ds...",
+                retry_delay,
             )
-            time.sleep(delay)
+            time.sleep(retry_delay)
         except Exception as exc:
             raise RuntimeError(f"Garmin authentication failed: {exc}") from exc
 
