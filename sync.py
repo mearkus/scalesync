@@ -24,7 +24,7 @@ import os
 import time
 from datetime import date, datetime, timedelta, timezone
 
-from garminconnect import Garmin
+from garminconnect import Garmin, GarminConnectTooManyRequestsError
 from wyze_sdk import Client
 from wyze_sdk.errors import WyzeApiError
 
@@ -112,13 +112,25 @@ def garmin_auth() -> Garmin:
     """Authenticate with Garmin Connect and return a logged-in client."""
     os.makedirs(GARMIN_TOKENS_DIR, exist_ok=True)
     os.chmod(GARMIN_TOKENS_DIR, 0o700)
-    try:
-        client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
-        client.login(tokenstore=GARMIN_TOKENS_DIR)
-        log.info("Garmin authentication successful.")
-        return client
-    except Exception as exc:
-        raise RuntimeError(f"Garmin authentication failed: {exc}") from exc
+    retry_delays = [30, 60, 120]
+    for attempt, delay in enumerate(retry_delays + [None], start=1):
+        try:
+            client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
+            client.login(tokenstore=GARMIN_TOKENS_DIR)
+            log.info("Garmin authentication successful.")
+            return client
+        except GarminConnectTooManyRequestsError as exc:
+            if delay is None:
+                raise RuntimeError(
+                    f"Garmin authentication rate-limited after {len(retry_delays) + 1} attempts: {exc}"
+                ) from exc
+            log.warning(
+                "Garmin rate-limited on auth (attempt %d/%d); retrying in %ds...",
+                attempt, len(retry_delays) + 1, delay,
+            )
+            time.sleep(delay)
+        except Exception as exc:
+            raise RuntimeError(f"Garmin authentication failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
