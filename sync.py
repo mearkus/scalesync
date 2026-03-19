@@ -192,7 +192,7 @@ def _record_payload(record) -> dict:
         "muscle_mass": _float(record.muscle),
         "basal_met": _int(bmr) if bmr is not None else None,
         "active_met": int(bmr * 1.25) if bmr is not None else None,
-        "physique_rating": _int(getattr(record, "body_type", None)) or 5,
+        "physique_rating": _int(body_type) if (body_type := getattr(record, "body_type", None)) is not None else 5,
         "metabolic_age": _int(getattr(record, "metabolic_age", None)),
         "visceral_fat_rating": _int(body_vfr),
         "bmi": _float(record.bmi),
@@ -233,8 +233,15 @@ def log_wyze_record(record, checksum: str) -> None:
 # Main sync
 # ---------------------------------------------------------------------------
 
-def sync_once() -> int:
-    """Run one sync cycle: fetch Wyze records, upload new ones to Garmin."""
+def sync_once(
+    wyze_token: str | None = None,
+    garmin_client: Garmin | None = None,
+) -> int:
+    """Run one sync cycle: fetch Wyze records, upload new ones to Garmin.
+
+    Pre-authenticated clients can be passed in to avoid re-authenticating on
+    each retry. If omitted, both services are authenticated fresh.
+    """
     log.info("--- Starting sync (DRY_RUN=%s) ---", DRY_RUN)
     uploaded = 0
     skipped = 0
@@ -243,8 +250,8 @@ def sync_once() -> int:
     log.info("Sync date window: %s to %s", window_start, window_end)
 
     # Authenticate both services regardless of dry-run mode
-    access_token = wyze_auth()
-    garmin_client = garmin_auth()
+    access_token = wyze_token if wyze_token is not None else wyze_auth()
+    garmin_client = garmin_client if garmin_client is not None else garmin_auth()
 
     synced = load_synced()
 
