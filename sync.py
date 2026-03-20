@@ -62,6 +62,7 @@ DATE_FROM = os.environ.get("DATE_FROM", "").strip()
 DATE_TO = os.environ.get("DATE_TO", "").strip()
 
 GARMIN_TOKENS_DIR = os.path.join(DATA_DIR, "garmin_tokens")
+GARMIN_BACKOFF_FILE = os.path.join(DATA_DIR, "garmin_auth_backoff")
 SYNCED_FILE = os.path.join(DATA_DIR, "synced.txt")
 
 # Wyze weight is reported in lbs; Garmin requires kg
@@ -108,35 +109,73 @@ def resolve_date_range() -> tuple[date, date]:
 # Garmin authentication
 # ---------------------------------------------------------------------------
 
+class GarminRateLimitBackoff(Exception):
+    """Raised when garmin_auth skips the attempt because a prior 429 is still
+    within its self-imposed backoff window."""
+
+
+# How long to self-impose a backoff after a 429 (26 h keeps us clear of the
+# daily 24-h ban window while still retrying on the second day after it).
+_GARMIN_BACKOFF_SECONDS = 26 * 3600
+
+
 def garmin_auth() -> Garmin:
     """Authenticate with Garmin Connect and return a logged-in client.
 
-    On a 429 the rate limit window can exceed 30 minutes, so we make at most
-    two attempts (one retry after a 15-minute wait).  Keeping the number of
-    exchange-endpoint hits low is more effective than clearing the token cache
-    (a fresh login uses the same oauth/exchange endpoint as a token refresh).
+    Garmin's oauth/exchange endpoint enforces a 24+ hour ban after repeated
+    429s.  To break the cycle we:
+      1. Check a cached backoff file — if still within the window, raise
+         GarminRateLimitBackoff so the caller can exit cleanly without making
+         any network request.
+      2. Make exactly one auth attempt.  No retries — every extra hit on the
+         exchange endpoint risks resetting / extending the ban.
+      3. On 429, write the backoff file (26 h from now) so the next day's run
+         also skips and gives the ban time to fully expire.
+      4. On success, remove the backoff file.
     """
+    import time as _time
+
+    # --- check self-imposed backoff ---
+    if os.path.exists(GARMIN_BACKOFF_FILE):
+        try:
+            retry_after = float(open(GARMIN_BACKOFF_FILE).read().strip())
+            remaining = retry_after - _time.time()
+            if remaining > 0:
+                hrs = remaining / 3600
+                raise GarminRateLimitBackoff(
+                    f"Garmin auth skipped: still in rate-limit backoff "
+                    f"({hrs:.1f}h remaining). Sync will resume automatically."
+                )
+        except GarminRateLimitBackoff:
+            raise
+        except Exception:
+            pass  # corrupt file — attempt auth anyway
+
     os.makedirs(GARMIN_TOKENS_DIR, exist_ok=True)
     os.chmod(GARMIN_TOKENS_DIR, 0o700)
-    retry_delay = 900  # 15 minutes
-    for attempt in range(1, 3):
+    try:
+        client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
+        client.login(tokenstore=GARMIN_TOKENS_DIR)
+        log.info("Garmin authentication successful.")
+        # Clear any leftover backoff file on success.
         try:
-            client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
-            client.login(tokenstore=GARMIN_TOKENS_DIR)
-            log.info("Garmin authentication successful.")
-            return client
-        except GarminConnectTooManyRequestsError as exc:
-            if attempt == 2:
-                raise RuntimeError(
-                    f"Garmin authentication rate-limited after 2 attempts: {exc}"
-                ) from exc
-            log.warning(
-                "Garmin rate-limited on auth (attempt 1/2); retrying in %ds...",
-                retry_delay,
-            )
-            time.sleep(retry_delay)
-        except Exception as exc:
-            raise RuntimeError(f"Garmin authentication failed: {exc}") from exc
+            os.remove(GARMIN_BACKOFF_FILE)
+        except FileNotFoundError:
+            pass
+        return client
+    except GarminConnectTooManyRequestsError as exc:
+        retry_after = _time.time() + _GARMIN_BACKOFF_SECONDS
+        try:
+            with open(GARMIN_BACKOFF_FILE, "w") as f:
+                f.write(str(retry_after))
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Garmin authentication rate-limited; "
+            f"backoff set for {_GARMIN_BACKOFF_SECONDS // 3600}h: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(f"Garmin authentication failed: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------

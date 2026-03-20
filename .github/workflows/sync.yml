@@ -25,7 +25,7 @@ jobs:
   sync:
     name: Sync scale data
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
@@ -89,13 +89,20 @@ jobs:
         run: |
           python - <<'EOF'
           import time
-          from sync import sync_once, wyze_auth, garmin_auth
+          from sync import sync_once, wyze_auth, garmin_auth, GarminRateLimitBackoff
 
           RETRY_INTERVAL_SEC = 300  # 5 minutes
           MAX_RETRIES = 6           # 30 minutes total
 
           wyze_token = wyze_auth()
-          garmin_client = garmin_auth()
+
+          try:
+              garmin_client = garmin_auth()
+          except GarminRateLimitBackoff as e:
+              # Still within the self-imposed backoff after a prior 429.
+              # Exit cleanly so we don't extend the ban with another attempt.
+              print(str(e))
+              raise SystemExit(0)
 
           if sync_once(wyze_token, garmin_client) > 0:
               raise SystemExit(0)
