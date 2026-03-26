@@ -37,19 +37,15 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      # Persist Garmin OAuth tokens and the list of already-synced checksums
-      # between workflow runs so we don't re-upload duplicates or re-login every time.
-      # save-always: true ensures the cache is written even on job failure so the
-      # Garmin rate-limit backoff file survives across runs.
+      # Restore persisted state (Garmin tokens, synced checksums, rate-limit
+      # backoff file) from the most recent previous run.
       - name: Restore sync state
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: data/
-          # New key each run so the latest state is always saved.
           key: scalesync-state-${{ github.run_id }}
           restore-keys: |
             scalesync-state-
-          save-always: true
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -118,3 +114,13 @@ jobs:
 
           print("No records found after 30 minutes of retries.")
           EOF
+
+      # Save state unconditionally so the Garmin rate-limit backoff file
+      # persists even when the job fails.  actions/cache/save runs independently
+      # of the outcome of the steps above.
+      - name: Save sync state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/
+          key: scalesync-state-${{ github.run_id }}
