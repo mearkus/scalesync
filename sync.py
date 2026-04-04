@@ -21,7 +21,7 @@ Optional:
 import hashlib
 import logging
 import os
-import time
+import time as _time
 from datetime import date, datetime, timedelta, timezone
 
 from garminconnect import Garmin, GarminConnectConnectionError, GarminConnectTooManyRequestsError
@@ -119,6 +119,21 @@ class GarminRateLimitBackoff(Exception):
 _GARMIN_BACKOFF_SECONDS = 26 * 3600
 
 
+def _is_garmin_rate_limit(exc: Exception) -> bool:
+    """Return True if exc represents a Garmin 429 / rate-limit response."""
+    return isinstance(exc, GarminConnectTooManyRequestsError) or "429" in str(exc)
+
+
+def _write_garmin_backoff() -> None:
+    """Write the backoff timestamp file so the next run skips auth."""
+    retry_after = _time.time() + _GARMIN_BACKOFF_SECONDS
+    try:
+        with open(GARMIN_BACKOFF_FILE, "w") as f:
+            f.write(str(retry_after))
+    except OSError:
+        pass
+
+
 def garmin_auth() -> Garmin:
     """Authenticate with Garmin Connect and return a logged-in client.
 
@@ -133,8 +148,6 @@ def garmin_auth() -> Garmin:
          also skips and gives the ban time to fully expire.
       4. On success, remove the backoff file.
     """
-    import time as _time
-
     # --- check self-imposed backoff ---
     if os.path.exists(GARMIN_BACKOFF_FILE):
         try:
@@ -175,14 +188,9 @@ def garmin_auth() -> Garmin:
         # credential login (no cached tokens) when the SSO endpoint rate-limits.
         # Both require backoff treatment; other GarminConnectConnectionErrors
         # (network failures, etc.) fall through to the generic handler.
-        if not (isinstance(exc, GarminConnectTooManyRequestsError) or "429" in str(exc)):
+        if not _is_garmin_rate_limit(exc):
             raise RuntimeError(f"Garmin authentication failed: {exc}") from exc
-        retry_after = _time.time() + _GARMIN_BACKOFF_SECONDS
-        try:
-            with open(GARMIN_BACKOFF_FILE, "w") as f:
-                f.write(str(retry_after))
-        except OSError:
-            pass
+        _write_garmin_backoff()
         raise RuntimeError(
             f"Garmin authentication rate-limited; "
             f"backoff set for {_GARMIN_BACKOFF_SECONDS // 3600}h: {exc}"
@@ -462,6 +470,13 @@ def sync_once(
                     _float(record.weight) if record.weight else 0,
                 )
             except Exception as exc:
+                if _is_garmin_rate_limit(exc):
+                    _write_garmin_backoff()
+                    raise RuntimeError(
+                        f"Garmin rate-limited during upload; "
+                        f"backoff set for {_GARMIN_BACKOFF_SECONDS // 3600}h. "
+                        f"Stopping retries: {exc}"
+                    ) from exc
                 log.error("Failed to upload record ts=%s: %s", record.measure_ts, exc)
 
     if DRY_RUN:
@@ -484,7 +499,7 @@ def main() -> None:
         except Exception as exc:
             log.error("Sync cycle failed: %s", exc)
         log.info("Sleeping %d minutes until next sync...", SYNC_INTERVAL)
-        time.sleep(SYNC_INTERVAL * 60)
+        _time.sleep(SYNC_INTERVAL * 60)
 
 
 if __name__ == "__main__":
