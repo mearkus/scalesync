@@ -24,7 +24,7 @@ import os
 import time
 from datetime import date, datetime, timedelta, timezone
 
-from garminconnect import Garmin, GarminConnectTooManyRequestsError
+from garminconnect import Garmin, GarminConnectConnectionError, GarminConnectTooManyRequestsError
 from wyze_sdk import Client
 from wyze_sdk.errors import WyzeApiError
 
@@ -169,7 +169,14 @@ def garmin_auth() -> Garmin:
         except FileNotFoundError:
             pass
         return client
-    except GarminConnectTooManyRequestsError as exc:
+    except (GarminConnectTooManyRequestsError, GarminConnectConnectionError) as exc:
+        # GarminConnectTooManyRequestsError: 429 on the OAuth exchange endpoint.
+        # GarminConnectConnectionError wrapping a 429: raised during a full
+        # credential login (no cached tokens) when the SSO endpoint rate-limits.
+        # Both require backoff treatment; other GarminConnectConnectionErrors
+        # (network failures, etc.) fall through to the generic handler.
+        if not (isinstance(exc, GarminConnectTooManyRequestsError) or "429" in str(exc)):
+            raise RuntimeError(f"Garmin authentication failed: {exc}") from exc
         retry_after = _time.time() + _GARMIN_BACKOFF_SECONDS
         try:
             with open(GARMIN_BACKOFF_FILE, "w") as f:
