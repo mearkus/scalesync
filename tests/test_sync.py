@@ -1,10 +1,12 @@
 """Tests for sync.py."""
 import importlib
 import os
+import time
 from datetime import date, datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
+from garminconnect import GarminConnectConnectionError, GarminConnectTooManyRequestsError
 
 import sync
 
@@ -493,6 +495,104 @@ class TestSyncOnce:
         assert result == 0  # upload failed, nothing marked synced
         mock_mark.assert_not_called()
 
+    @patch("sync.mark_synced")
+    @patch("sync.load_synced", return_value=set())
+    @patch("sync.garmin_auth")
+    @patch("sync.wyze_auth", return_value="fake-token")
+    @patch("sync.Client")
+    def test_upload_429_writes_backoff_and_raises(self, mock_client_cls, mock_wyze, mock_garmin, mock_load, mock_mark, tmp_path):
+        device = _make_device()
+        record = _make_record()
+        self._setup_client(mock_client_cls, devices=[device], scale_records=[record])
+        mock_garmin.return_value.add_body_composition.side_effect = \
+            GarminConnectTooManyRequestsError()
+
+        backoff_file = tmp_path / "backoff"
+        with patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
+             patch.object(sync, "DRY_RUN", False), \
+             patch.object(sync, "DATE_FROM", "2024-01-01"), \
+             patch.object(sync, "DATE_TO", "2024-01-01"):
+            with pytest.raises(RuntimeError, match="rate-limited during upload"):
+                sync.sync_once()
+
+        assert backoff_file.exists()
+        assert float(backoff_file.read_text()) > time.time()
+
+    @patch("sync.mark_synced")
+    @patch("sync.load_synced", return_value=set())
+    @patch("sync.garmin_auth")
+    @patch("sync.wyze_auth", return_value="fake-token")
+    @patch("sync.Client")
+    def test_upload_429_via_connection_error_writes_backoff(self, mock_client_cls, mock_wyze, mock_garmin, mock_load, mock_mark, tmp_path):
+        device = _make_device()
+        record = _make_record()
+        self._setup_client(mock_client_cls, devices=[device], scale_records=[record])
+        mock_garmin.return_value.add_body_composition.side_effect = \
+            GarminConnectConnectionError("Error: 429 Too Many Requests")
+
+        backoff_file = tmp_path / "backoff"
+        with patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
+             patch.object(sync, "DRY_RUN", False), \
+             patch.object(sync, "DATE_FROM", "2024-01-01"), \
+             patch.object(sync, "DATE_TO", "2024-01-01"):
+            with pytest.raises(RuntimeError, match="rate-limited during upload"):
+                sync.sync_once()
+
+        assert backoff_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# _is_garmin_rate_limit
+# ---------------------------------------------------------------------------
+
+class TestIsGarminRateLimit:
+    def test_true_for_too_many_requests_error(self):
+        assert sync._is_garmin_rate_limit(GarminConnectTooManyRequestsError())
+
+    def test_true_for_connection_error_with_429(self):
+        exc = GarminConnectConnectionError("Login failed: 429 Too Many Requests")
+        assert sync._is_garmin_rate_limit(exc)
+
+    def test_false_for_connection_error_without_429(self):
+        exc = GarminConnectConnectionError("Login failed: connection refused")
+        assert not sync._is_garmin_rate_limit(exc)
+
+    def test_false_for_generic_exception(self):
+        assert not sync._is_garmin_rate_limit(RuntimeError("something else"))
+
+    def test_true_for_runtime_error_mentioning_429(self):
+        # garth can surface 429 as a plain RuntimeError in some paths
+        assert sync._is_garmin_rate_limit(RuntimeError("HTTP 429 Too Many Requests"))
+
+
+# ---------------------------------------------------------------------------
+# _write_garmin_backoff
+# ---------------------------------------------------------------------------
+
+class TestWriteGarminBackoff:
+    def test_writes_future_timestamp(self, tmp_path):
+        backoff_file = tmp_path / "garmin_backoff"
+        before = time.time()
+        with patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)):
+            sync._write_garmin_backoff()
+        after = time.time()
+        ts = float(backoff_file.read_text())
+        assert ts > before
+        assert ts <= after + sync._GARMIN_BACKOFF_SECONDS + 1
+
+    def test_timestamp_is_approximately_26h_from_now(self, tmp_path):
+        backoff_file = tmp_path / "garmin_backoff"
+        before = time.time()
+        with patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)):
+            sync._write_garmin_backoff()
+        ts = float(backoff_file.read_text())
+        # Allow 5 s of slop
+        assert abs(ts - (before + sync._GARMIN_BACKOFF_SECONDS)) < 5
+
+    def test_silently_ignores_os_error(self, tmp_path):
+        with patch.object(sync, "GARMIN_BACKOFF_FILE", "/nonexistent/dir/backoff"):
+            sync._write_garmin_backoff()  # should not raise
+
 
 # ---------------------------------------------------------------------------
 # garmin_auth
@@ -514,6 +614,137 @@ class TestGarminAuth:
             mock_garmin_cls.return_value.login.side_effect = Exception("auth failed")
             with pytest.raises(RuntimeError, match="Garmin authentication failed"):
                 sync.garmin_auth()
+
+    # --- backoff file ---
+
+    def test_raises_backoff_when_file_active(self, tmp_path):
+        token_dir = tmp_path / "garmin_tokens"
+        backoff_file = tmp_path / "backoff"
+        backoff_file.write_text(str(time.time() + 3600))  # 1 h from now
+        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
+             patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Garmin") as mock_garmin_cls:
+            with pytest.raises(sync.GarminRateLimitBackoff, match="rate-limit backoff"):
+                sync.garmin_auth()
+        mock_garmin_cls.assert_not_called()  # no network attempt
+
+    def test_proceeds_when_backoff_file_expired(self, tmp_path):
+        token_dir = tmp_path / "garmin_tokens"
+        backoff_file = tmp_path / "backoff"
+        backoff_file.write_text(str(time.time() - 1))  # 1 s in the past
+        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
+             patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Garmin") as mock_garmin_cls:
+            mock_garmin_cls.return_value.login.return_value = None
+            sync.garmin_auth()  # should not raise
+
+    def test_proceeds_when_backoff_file_corrupt(self, tmp_path):
+        token_dir = tmp_path / "garmin_tokens"
+        backoff_file = tmp_path / "backoff"
+        backoff_file.write_text("not-a-number")
+        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
+             patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Garmin") as mock_garmin_cls:
+            mock_garmin_cls.return_value.login.return_value = None
+            sync.garmin_auth()  # corrupt file → attempt auth anyway
+
+    # --- cold-start (no cached tokens) ---
+
+    def test_cold_start_calls_login_without_tokenstore(self, tmp_path):
+        token_dir = tmp_path / "garmin_tokens"  # directory does not exist yet
+        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
+             patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
+             patch("sync.Garmin") as mock_garmin_cls:
+            mock_client = mock_garmin_cls.return_value
+            mock_client.login.return_value = None
+            sync.garmin_auth()
+        # tokenstore kwarg must NOT have been passed
+        mock_client.login.assert_called_once_with()
+
+    def test_cold_start_dumps_tokens_after_login(self, tmp_path):
+        token_dir = tmp_path / "garmin_tokens"
+        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
+             patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
+             patch("sync.Garmin") as mock_garmin_cls:
+            mock_client = mock_garmin_cls.return_value
+            mock_client.login.return_value = None
+            sync.garmin_auth()
+        mock_client.garth.dump.assert_called_once_with(str(token_dir))
+
+    # --- warm-start (cached tokens exist) ---
+
+    def test_warm_start_calls_login_with_tokenstore(self, tmp_path):
+        token_dir = tmp_path / "garmin_tokens"
+        token_dir.mkdir()
+        (token_dir / "oauth1_token.json").write_text("{}")
+        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
+             patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
+             patch("sync.Garmin") as mock_garmin_cls:
+            mock_client = mock_garmin_cls.return_value
+            mock_client.login.return_value = None
+            sync.garmin_auth()
+        mock_client.login.assert_called_once_with(tokenstore=str(token_dir))
+
+    def test_warm_start_does_not_dump_tokens(self, tmp_path):
+        token_dir = tmp_path / "garmin_tokens"
+        token_dir.mkdir()
+        (token_dir / "oauth1_token.json").write_text("{}")
+        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
+             patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
+             patch("sync.Garmin") as mock_garmin_cls:
+            mock_client = mock_garmin_cls.return_value
+            mock_client.login.return_value = None
+            sync.garmin_auth()
+        mock_client.garth.dump.assert_not_called()
+
+    # --- 429 handling ---
+
+    def test_429_via_too_many_requests_writes_backoff(self, tmp_path):
+        token_dir = tmp_path / "garmin_tokens"
+        backoff_file = tmp_path / "backoff"
+        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
+             patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Garmin") as mock_garmin_cls:
+            mock_garmin_cls.return_value.login.side_effect = GarminConnectTooManyRequestsError()
+            with pytest.raises(RuntimeError, match="rate-limited"):
+                sync.garmin_auth()
+        assert backoff_file.exists()
+        assert float(backoff_file.read_text()) > time.time()
+
+    def test_429_via_connection_error_writes_backoff(self, tmp_path):
+        token_dir = tmp_path / "garmin_tokens"
+        backoff_file = tmp_path / "backoff"
+        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
+             patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Garmin") as mock_garmin_cls:
+            exc = GarminConnectConnectionError("Login failed: 429 Too Many Requests")
+            mock_garmin_cls.return_value.login.side_effect = exc
+            with pytest.raises(RuntimeError, match="rate-limited"):
+                sync.garmin_auth()
+        assert backoff_file.exists()
+
+    def test_non_429_connection_error_does_not_write_backoff(self, tmp_path):
+        token_dir = tmp_path / "garmin_tokens"
+        backoff_file = tmp_path / "backoff"
+        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
+             patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Garmin") as mock_garmin_cls:
+            exc = GarminConnectConnectionError("connection refused")
+            mock_garmin_cls.return_value.login.side_effect = exc
+            with pytest.raises(RuntimeError, match="Garmin authentication failed"):
+                sync.garmin_auth()
+        assert not backoff_file.exists()
+
+    def test_success_clears_existing_backoff_file(self, tmp_path):
+        token_dir = tmp_path / "garmin_tokens"
+        backoff_file = tmp_path / "backoff"
+        backoff_file.write_text(str(time.time() - 1))  # expired backoff
+        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
+             patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Garmin") as mock_garmin_cls:
+            mock_garmin_cls.return_value.login.return_value = None
+            sync.garmin_auth()
+        assert not backoff_file.exists()
 
 
 # ---------------------------------------------------------------------------
