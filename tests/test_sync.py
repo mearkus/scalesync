@@ -599,8 +599,14 @@ class TestWriteGarminBackoff:
 # ---------------------------------------------------------------------------
 
 class TestGarminAuth:
+    def _seed_tokens(self, token_dir):
+        """Create a minimal oauth1_token.json so garmin_auth passes the token check."""
+        token_dir.mkdir(exist_ok=True)
+        (token_dir / "oauth1_token.json").write_text("{}")
+
     def test_sets_token_dir_permissions(self, tmp_path):
         token_dir = tmp_path / "garmin_tokens"
+        self._seed_tokens(token_dir)
         with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
              patch("sync.Garmin") as mock_garmin_cls:
             mock_garmin_cls.return_value.login.return_value = None
@@ -609,6 +615,7 @@ class TestGarminAuth:
 
     def test_raises_runtime_error_on_failure(self, tmp_path):
         token_dir = tmp_path / "garmin_tokens"
+        self._seed_tokens(token_dir)
         with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
              patch("sync.Garmin") as mock_garmin_cls:
             mock_garmin_cls.return_value.login.side_effect = Exception("auth failed")
@@ -630,6 +637,7 @@ class TestGarminAuth:
 
     def test_proceeds_when_backoff_file_expired(self, tmp_path):
         token_dir = tmp_path / "garmin_tokens"
+        self._seed_tokens(token_dir)
         backoff_file = tmp_path / "backoff"
         backoff_file.write_text(str(time.time() - 1))  # 1 s in the past
         with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
@@ -640,6 +648,7 @@ class TestGarminAuth:
 
     def test_proceeds_when_backoff_file_corrupt(self, tmp_path):
         token_dir = tmp_path / "garmin_tokens"
+        self._seed_tokens(token_dir)
         backoff_file = tmp_path / "backoff"
         backoff_file.write_text("not-a-number")
         with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
@@ -648,28 +657,16 @@ class TestGarminAuth:
             mock_garmin_cls.return_value.login.return_value = None
             sync.garmin_auth()  # corrupt file → attempt auth anyway
 
-    # --- cold-start (no cached tokens) ---
+    # --- missing tokens ---
 
-    def test_cold_start_calls_login_without_tokenstore(self, tmp_path):
-        token_dir = tmp_path / "garmin_tokens"  # directory does not exist yet
-        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
-             patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
-             patch("sync.Garmin") as mock_garmin_cls:
-            mock_client = mock_garmin_cls.return_value
-            mock_client.login.return_value = None
-            sync.garmin_auth()
-        # tokenstore kwarg must NOT have been passed
-        mock_client.login.assert_called_once_with()
-
-    def test_cold_start_dumps_tokens_after_login(self, tmp_path):
+    def test_raises_when_no_token_file(self, tmp_path):
         token_dir = tmp_path / "garmin_tokens"
         with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
              patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
              patch("sync.Garmin") as mock_garmin_cls:
-            mock_client = mock_garmin_cls.return_value
-            mock_client.login.return_value = None
-            sync.garmin_auth()
-        mock_client.garth.dump.assert_called_once_with(str(token_dir))
+            with pytest.raises(RuntimeError, match="No Garmin OAuth tokens found"):
+                sync.garmin_auth()
+        mock_garmin_cls.assert_not_called()
 
     # --- warm-start (cached tokens exist) ---
 
@@ -701,6 +698,7 @@ class TestGarminAuth:
 
     def test_429_via_too_many_requests_writes_backoff(self, tmp_path):
         token_dir = tmp_path / "garmin_tokens"
+        self._seed_tokens(token_dir)
         backoff_file = tmp_path / "backoff"
         with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
              patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
@@ -713,6 +711,7 @@ class TestGarminAuth:
 
     def test_429_via_connection_error_writes_backoff(self, tmp_path):
         token_dir = tmp_path / "garmin_tokens"
+        self._seed_tokens(token_dir)
         backoff_file = tmp_path / "backoff"
         with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
              patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
@@ -725,6 +724,7 @@ class TestGarminAuth:
 
     def test_non_429_connection_error_does_not_write_backoff(self, tmp_path):
         token_dir = tmp_path / "garmin_tokens"
+        self._seed_tokens(token_dir)
         backoff_file = tmp_path / "backoff"
         with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
              patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
@@ -737,6 +737,7 @@ class TestGarminAuth:
 
     def test_success_clears_existing_backoff_file(self, tmp_path):
         token_dir = tmp_path / "garmin_tokens"
+        self._seed_tokens(token_dir)
         backoff_file = tmp_path / "backoff"
         backoff_file.write_text(str(time.time() - 1))  # expired backoff
         with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \

@@ -37,8 +37,19 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      # Restore persisted state (Garmin tokens, synced checksums, rate-limit
-      # backoff file) from the most recent previous run.
+      # Inject Garmin OAuth tokens from secrets so fresh logins are never
+      # needed. Garmin's SSO endpoint blocks automated requests (429); using
+      # pre-generated tokens from a real browser login avoids that entirely.
+      # The cached data/ directory then keeps them refreshed run-to-run.
+      - name: Inject Garmin tokens
+        run: |
+          mkdir -p data/garmin_tokens
+          echo "${{ secrets.GARMIN_OAUTH1_TOKEN }}" | base64 -d > data/garmin_tokens/oauth1_token.json
+          echo "${{ secrets.GARMIN_OAUTH2_TOKEN }}" | base64 -d > data/garmin_tokens/oauth2_token.json
+
+      # Restore persisted state (refreshed Garmin tokens, synced checksums,
+      # rate-limit backoff file) from the most recent previous run.
+      # Runs after token injection so a cached warm token beats the secret.
       - name: Restore sync state
         uses: actions/cache/restore@v4
         with:

@@ -166,15 +166,15 @@ def garmin_auth() -> Garmin:
 
     os.makedirs(GARMIN_TOKENS_DIR, exist_ok=True)
     os.chmod(GARMIN_TOKENS_DIR, 0o700)
-    tokens_exist = os.path.exists(os.path.join(GARMIN_TOKENS_DIR, "oauth1_token.json"))
+    if not os.path.exists(os.path.join(GARMIN_TOKENS_DIR, "oauth1_token.json")):
+        raise RuntimeError(
+            "No Garmin OAuth tokens found. "
+            "Run generate_tokens.py locally and store the output as "
+            "GARMIN_OAUTH1_TOKEN / GARMIN_OAUTH2_TOKEN GitHub secrets."
+        )
     try:
         client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
-        if tokens_exist:
-            client.login(tokenstore=GARMIN_TOKENS_DIR)
-        else:
-            log.info("No cached Garmin tokens found; performing full login.")
-            client.login()
-            client.garth.dump(GARMIN_TOKENS_DIR)
+        client.login(tokenstore=GARMIN_TOKENS_DIR)
         log.info("Garmin authentication successful.")
         # Clear any leftover backoff file on success.
         try:
