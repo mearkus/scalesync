@@ -6,7 +6,6 @@ from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, call, patch
 
 import pytest
-from garminconnect import GarminConnectConnectionError, GarminConnectTooManyRequestsError
 
 import sync
 
@@ -20,8 +19,6 @@ _BASE_ENV = {
     "WYZE_PASSWORD": "testpassword",
     "WYZE_KEY_ID": "test-key-id",
     "WYZE_API_KEY": "test-api-key",
-    "GARMIN_EMAIL": "garmin@example.com",
-    "GARMIN_PASSWORD": "garminpassword",
     "SYNC_INTERVAL": "30",
     "DATA_DIR": "/tmp/scalesync-test",
 }
@@ -321,9 +318,9 @@ class TestDataDir:
         assert ".." not in mod.DATA_DIR
         assert os.path.isabs(mod.DATA_DIR)
 
-    def test_garmin_tokens_dir_is_subpath(self):
+    def test_garmin_cookie_file_is_subpath(self):
         mod = _reload({"DATA_DIR": "/tmp/scalesync-test"})
-        assert mod.GARMIN_TOKENS_DIR.startswith(mod.DATA_DIR)
+        assert mod.GARMIN_COOKIE_FILE.startswith(mod.DATA_DIR)
 
     def test_synced_file_is_subpath(self):
         mod = _reload({"DATA_DIR": "/tmp/scalesync-test"})
@@ -374,7 +371,7 @@ class TestSyncOnce:
             result = sync.sync_once()
 
         assert result == 1
-        mock_garmin.return_value.add_body_composition.assert_called_once()
+        mock_garmin.return_value.upload_weight.assert_called_once()
         mock_mark.assert_called_once()
 
     @patch("sync.mark_synced")
@@ -396,7 +393,7 @@ class TestSyncOnce:
             result = sync.sync_once()
 
         assert result == 0
-        mock_garmin.return_value.add_body_composition.assert_not_called()
+        mock_garmin.return_value.upload_weight.assert_not_called()
         mock_mark.assert_not_called()
 
     @patch("sync.mark_synced")
@@ -415,7 +412,7 @@ class TestSyncOnce:
             result = sync.sync_once()
 
         assert result == 1
-        mock_garmin.return_value.add_body_composition.assert_not_called()
+        mock_garmin.return_value.upload_weight.assert_not_called()
         mock_mark.assert_not_called()
 
     @patch("sync.mark_synced")
@@ -434,7 +431,7 @@ class TestSyncOnce:
             result = sync.sync_once()
 
         assert result == 0
-        mock_garmin.return_value.add_body_composition.assert_not_called()
+        mock_garmin.return_value.upload_weight.assert_not_called()
 
     @patch("sync.mark_synced")
     @patch("sync.load_synced", return_value=set())
@@ -452,7 +449,7 @@ class TestSyncOnce:
             result = sync.sync_once()
 
         assert result == 0
-        mock_garmin.return_value.add_body_composition.assert_not_called()
+        mock_garmin.return_value.upload_weight.assert_not_called()
 
     @patch("sync.mark_synced")
     @patch("sync.load_synced", return_value=set())
@@ -473,7 +470,7 @@ class TestSyncOnce:
             result = sync.sync_once()
 
         assert result == 2
-        assert mock_garmin.return_value.add_body_composition.call_count == 2
+        assert mock_garmin.return_value.upload_weight.call_count == 2
         assert mock_mark.call_count == 2
 
     @patch("sync.mark_synced")
@@ -485,7 +482,7 @@ class TestSyncOnce:
         device = _make_device()
         record = _make_record()
         self._setup_client(mock_client_cls, devices=[device], scale_records=[record])
-        mock_garmin.return_value.add_body_composition.side_effect = RuntimeError("API error")
+        mock_garmin.return_value.upload_weight.side_effect = RuntimeError("API error")
 
         with patch.object(sync, "DRY_RUN", False), \
              patch.object(sync, "DATE_FROM", "2024-01-01"), \
@@ -504,8 +501,8 @@ class TestSyncOnce:
         device = _make_device()
         record = _make_record()
         self._setup_client(mock_client_cls, devices=[device], scale_records=[record])
-        mock_garmin.return_value.add_body_composition.side_effect = \
-            GarminConnectTooManyRequestsError()
+        mock_garmin.return_value.upload_weight.side_effect = \
+            RuntimeError("429 Too Many Requests")
 
         backoff_file = tmp_path / "backoff"
         with patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
@@ -523,22 +520,22 @@ class TestSyncOnce:
     @patch("sync.garmin_auth")
     @patch("sync.wyze_auth", return_value="fake-token")
     @patch("sync.Client")
-    def test_upload_429_via_connection_error_writes_backoff(self, mock_client_cls, mock_wyze, mock_garmin, mock_load, mock_mark, tmp_path):
+    def test_upload_non_429_error_does_not_write_backoff(self, mock_client_cls, mock_wyze, mock_garmin, mock_load, mock_mark, tmp_path):
         device = _make_device()
         record = _make_record()
         self._setup_client(mock_client_cls, devices=[device], scale_records=[record])
-        mock_garmin.return_value.add_body_composition.side_effect = \
-            GarminConnectConnectionError("Error: 429 Too Many Requests")
+        mock_garmin.return_value.upload_weight.side_effect = \
+            RuntimeError("connection refused")
 
         backoff_file = tmp_path / "backoff"
         with patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
              patch.object(sync, "DRY_RUN", False), \
              patch.object(sync, "DATE_FROM", "2024-01-01"), \
              patch.object(sync, "DATE_TO", "2024-01-01"):
-            with pytest.raises(RuntimeError, match="rate-limited during upload"):
-                sync.sync_once()
+            result = sync.sync_once()
 
-        assert backoff_file.exists()
+        assert result == 0
+        assert not backoff_file.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -546,23 +543,20 @@ class TestSyncOnce:
 # ---------------------------------------------------------------------------
 
 class TestIsGarminRateLimit:
-    def test_true_for_too_many_requests_error(self):
-        assert sync._is_garmin_rate_limit(GarminConnectTooManyRequestsError())
+    def test_true_for_runtime_error_with_429(self):
+        assert sync._is_garmin_rate_limit(RuntimeError("429 Too Many Requests"))
 
-    def test_true_for_connection_error_with_429(self):
-        exc = GarminConnectConnectionError("Login failed: 429 Too Many Requests")
-        assert sync._is_garmin_rate_limit(exc)
-
-    def test_false_for_connection_error_without_429(self):
-        exc = GarminConnectConnectionError("Login failed: connection refused")
-        assert not sync._is_garmin_rate_limit(exc)
+    def test_true_for_runtime_error_with_429_in_body(self):
+        assert sync._is_garmin_rate_limit(RuntimeError("HTTP 429 Too Many Requests: quota exceeded"))
 
     def test_false_for_generic_exception(self):
         assert not sync._is_garmin_rate_limit(RuntimeError("something else"))
 
-    def test_true_for_runtime_error_mentioning_429(self):
-        # garth can surface 429 as a plain RuntimeError in some paths
-        assert sync._is_garmin_rate_limit(RuntimeError("HTTP 429 Too Many Requests"))
+    def test_false_for_connection_refused(self):
+        assert not sync._is_garmin_rate_limit(RuntimeError("connection refused"))
+
+    def test_true_for_http_error_mentioning_429(self):
+        assert sync._is_garmin_rate_limit(Exception("status 429"))
 
 
 # ---------------------------------------------------------------------------
@@ -599,152 +593,73 @@ class TestWriteGarminBackoff:
 # ---------------------------------------------------------------------------
 
 class TestGarminAuth:
-    def test_sets_token_dir_permissions(self, tmp_path):
-        token_dir = tmp_path / "garmin_tokens"
-        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
-             patch("sync.Garmin") as mock_garmin_cls:
-            mock_garmin_cls.return_value.login.return_value = None
-            sync.garmin_auth()
-        assert oct(token_dir.stat().st_mode)[-3:] == "700"
-
-    def test_raises_runtime_error_on_failure(self, tmp_path):
-        token_dir = tmp_path / "garmin_tokens"
-        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
-             patch("sync.Garmin") as mock_garmin_cls:
-            mock_garmin_cls.return_value.login.side_effect = Exception("auth failed")
-            with pytest.raises(RuntimeError, match="Garmin authentication failed"):
-                sync.garmin_auth()
-
     # --- backoff file ---
 
     def test_raises_backoff_when_file_active(self, tmp_path):
-        token_dir = tmp_path / "garmin_tokens"
         backoff_file = tmp_path / "backoff"
         backoff_file.write_text(str(time.time() + 3600))  # 1 h from now
-        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
-             patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
-             patch("sync.Garmin") as mock_garmin_cls:
+        with patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
+             patch.object(sync, "GARMIN_COOKIE_FILE", str(tmp_path / "garmin_cookies")), \
+             patch.object(sync, "GARMIN_COOKIES_ENV", ""):
             with pytest.raises(sync.GarminRateLimitBackoff, match="rate-limit backoff"):
                 sync.garmin_auth()
-        mock_garmin_cls.assert_not_called()  # no network attempt
 
     def test_proceeds_when_backoff_file_expired(self, tmp_path):
-        token_dir = tmp_path / "garmin_tokens"
+        cookie_file = tmp_path / "garmin_cookies"
+        cookie_file.write_text("JWT_WEB=abc; SESSION=xyz")
         backoff_file = tmp_path / "backoff"
         backoff_file.write_text(str(time.time() - 1))  # 1 s in the past
-        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
-             patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
-             patch("sync.Garmin") as mock_garmin_cls:
-            mock_garmin_cls.return_value.login.return_value = None
-            sync.garmin_auth()  # should not raise
+        with patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
+             patch.object(sync, "GARMIN_COOKIE_FILE", str(cookie_file)), \
+             patch.object(sync, "GARMIN_COOKIES_ENV", ""):
+            client = sync.garmin_auth()
+        assert isinstance(client, sync.GarminCookieClient)
 
     def test_proceeds_when_backoff_file_corrupt(self, tmp_path):
-        token_dir = tmp_path / "garmin_tokens"
+        cookie_file = tmp_path / "garmin_cookies"
+        cookie_file.write_text("JWT_WEB=abc; SESSION=xyz")
         backoff_file = tmp_path / "backoff"
         backoff_file.write_text("not-a-number")
-        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
-             patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
-             patch("sync.Garmin") as mock_garmin_cls:
-            mock_garmin_cls.return_value.login.return_value = None
-            sync.garmin_auth()  # corrupt file → attempt auth anyway
+        with patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
+             patch.object(sync, "GARMIN_COOKIE_FILE", str(cookie_file)), \
+             patch.object(sync, "GARMIN_COOKIES_ENV", ""):
+            client = sync.garmin_auth()  # corrupt file → proceed anyway
+        assert isinstance(client, sync.GarminCookieClient)
 
-    # --- cold-start (no cached tokens) ---
+    # --- cookie loading ---
 
-    def test_cold_start_calls_login_without_tokenstore(self, tmp_path):
-        token_dir = tmp_path / "garmin_tokens"  # directory does not exist yet
-        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
-             patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
-             patch("sync.Garmin") as mock_garmin_cls:
-            mock_client = mock_garmin_cls.return_value
-            mock_client.login.return_value = None
-            sync.garmin_auth()
-        # tokenstore kwarg must NOT have been passed
-        mock_client.login.assert_called_once_with()
+    def test_loads_cookies_from_env(self, tmp_path):
+        with patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
+             patch.object(sync, "GARMIN_COOKIE_FILE", str(tmp_path / "garmin_cookies")), \
+             patch.object(sync, "GARMIN_COOKIES_ENV", "JWT_WEB=token123"), \
+             patch.object(sync, "DATA_DIR", str(tmp_path)):
+            client = sync.garmin_auth()
+        assert isinstance(client, sync.GarminCookieClient)
 
-    def test_cold_start_dumps_tokens_after_login(self, tmp_path):
-        token_dir = tmp_path / "garmin_tokens"
-        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
-             patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
-             patch("sync.Garmin") as mock_garmin_cls:
-            mock_client = mock_garmin_cls.return_value
-            mock_client.login.return_value = None
-            sync.garmin_auth()
-        mock_client.garth.dump.assert_called_once_with(str(token_dir))
+    def test_loads_cookies_from_file(self, tmp_path):
+        cookie_file = tmp_path / "garmin_cookies"
+        cookie_file.write_text("JWT_WEB=abc; SESSION=xyz")
+        with patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
+             patch.object(sync, "GARMIN_COOKIE_FILE", str(cookie_file)), \
+             patch.object(sync, "GARMIN_COOKIES_ENV", ""):
+            client = sync.garmin_auth()
+        assert isinstance(client, sync.GarminCookieClient)
 
-    # --- warm-start (cached tokens exist) ---
-
-    def test_warm_start_calls_login_with_tokenstore(self, tmp_path):
-        token_dir = tmp_path / "garmin_tokens"
-        token_dir.mkdir()
-        (token_dir / "oauth1_token.json").write_text("{}")
-        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
-             patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
-             patch("sync.Garmin") as mock_garmin_cls:
-            mock_client = mock_garmin_cls.return_value
-            mock_client.login.return_value = None
-            sync.garmin_auth()
-        mock_client.login.assert_called_once_with(tokenstore=str(token_dir))
-
-    def test_warm_start_does_not_dump_tokens(self, tmp_path):
-        token_dir = tmp_path / "garmin_tokens"
-        token_dir.mkdir()
-        (token_dir / "oauth1_token.json").write_text("{}")
-        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
-             patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
-             patch("sync.Garmin") as mock_garmin_cls:
-            mock_client = mock_garmin_cls.return_value
-            mock_client.login.return_value = None
-            sync.garmin_auth()
-        mock_client.garth.dump.assert_not_called()
-
-    # --- 429 handling ---
-
-    def test_429_via_too_many_requests_writes_backoff(self, tmp_path):
-        token_dir = tmp_path / "garmin_tokens"
-        backoff_file = tmp_path / "backoff"
-        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
-             patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
-             patch("sync.Garmin") as mock_garmin_cls:
-            mock_garmin_cls.return_value.login.side_effect = GarminConnectTooManyRequestsError()
-            with pytest.raises(RuntimeError, match="rate-limited"):
+    def test_raises_when_no_cookies(self, tmp_path):
+        with patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
+             patch.object(sync, "GARMIN_COOKIE_FILE", str(tmp_path / "garmin_cookies")), \
+             patch.object(sync, "GARMIN_COOKIES_ENV", ""):
+            with pytest.raises(RuntimeError, match="No Garmin session cookies found"):
                 sync.garmin_auth()
-        assert backoff_file.exists()
-        assert float(backoff_file.read_text()) > time.time()
 
-    def test_429_via_connection_error_writes_backoff(self, tmp_path):
-        token_dir = tmp_path / "garmin_tokens"
-        backoff_file = tmp_path / "backoff"
-        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
-             patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
-             patch("sync.Garmin") as mock_garmin_cls:
-            exc = GarminConnectConnectionError("Login failed: 429 Too Many Requests")
-            mock_garmin_cls.return_value.login.side_effect = exc
-            with pytest.raises(RuntimeError, match="rate-limited"):
-                sync.garmin_auth()
-        assert backoff_file.exists()
-
-    def test_non_429_connection_error_does_not_write_backoff(self, tmp_path):
-        token_dir = tmp_path / "garmin_tokens"
-        backoff_file = tmp_path / "backoff"
-        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
-             patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
-             patch("sync.Garmin") as mock_garmin_cls:
-            exc = GarminConnectConnectionError("connection refused")
-            mock_garmin_cls.return_value.login.side_effect = exc
-            with pytest.raises(RuntimeError, match="Garmin authentication failed"):
-                sync.garmin_auth()
-        assert not backoff_file.exists()
-
-    def test_success_clears_existing_backoff_file(self, tmp_path):
-        token_dir = tmp_path / "garmin_tokens"
-        backoff_file = tmp_path / "backoff"
-        backoff_file.write_text(str(time.time() - 1))  # expired backoff
-        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
-             patch.object(sync, "GARMIN_BACKOFF_FILE", str(backoff_file)), \
-             patch("sync.Garmin") as mock_garmin_cls:
-            mock_garmin_cls.return_value.login.return_value = None
+    def test_env_cookies_written_to_file(self, tmp_path):
+        cookie_file = tmp_path / "garmin_cookies"
+        with patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
+             patch.object(sync, "GARMIN_COOKIE_FILE", str(cookie_file)), \
+             patch.object(sync, "GARMIN_COOKIES_ENV", "JWT_WEB=token123"), \
+             patch.object(sync, "DATA_DIR", str(tmp_path)):
             sync.garmin_auth()
-        assert not backoff_file.exists()
+        assert cookie_file.read_text() == "JWT_WEB=token123"
 
 
 # ---------------------------------------------------------------------------

@@ -1,2 +1,2 @@
 wyze-sdk==2.2.0
-garminconnect==0.2.38
+requests

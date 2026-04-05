@@ -37,8 +37,19 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      # Restore persisted state (Garmin tokens, synced checksums, rate-limit
-      # backoff file) from the most recent previous run.
+      # Inject Garmin session cookies from the secret so automated uploads
+      # work without OAuth.  Garmin's SSO has blocked automated OAuth clients
+      # since March 2026; cookie-based auth is the only viable path.
+      # Cookies are valid for ~3 weeks; re-run generate_cookies.py and update
+      # the GARMIN_COOKIES secret when the workflow starts returning 401s.
+      - name: Inject Garmin cookies
+        run: |
+          mkdir -p data
+          echo "${{ secrets.GARMIN_COOKIES }}" | base64 -d > data/garmin_cookies
+
+      # Restore persisted state (refreshed Garmin tokens, synced checksums,
+      # rate-limit backoff file) from the most recent previous run.
+      # Runs after token injection so a cached warm token beats the secret.
       - name: Restore sync state
         uses: actions/cache/restore@v4
         with:
@@ -75,8 +86,6 @@ jobs:
           WYZE_PASSWORD: ${{ secrets.WYZE_PASSWORD }}
           WYZE_KEY_ID:   ${{ secrets.WYZE_KEY_ID }}
           WYZE_API_KEY:  ${{ secrets.WYZE_API_KEY }}
-          GARMIN_EMAIL:    ${{ secrets.GARMIN_EMAIL }}
-          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
           # Point state files at the cached data directory
           DATA_DIR: data
           # Manual run input overrides repo variable; default is live upload.

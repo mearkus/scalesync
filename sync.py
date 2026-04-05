@@ -21,10 +21,11 @@ Optional:
 import hashlib
 import logging
 import os
+import re
 import time as _time
 from datetime import date, datetime, timedelta, timezone
 
-from garminconnect import Garmin, GarminConnectConnectionError, GarminConnectTooManyRequestsError
+import requests
 from wyze_sdk import Client
 from wyze_sdk.errors import WyzeApiError
 
@@ -44,8 +45,7 @@ WYZE_PASSWORD = os.environ["WYZE_PASSWORD"]
 WYZE_KEY_ID = os.environ["WYZE_KEY_ID"]
 WYZE_API_KEY = os.environ["WYZE_API_KEY"]
 
-GARMIN_EMAIL = os.environ["GARMIN_EMAIL"]
-GARMIN_PASSWORD = os.environ["GARMIN_PASSWORD"]
+GARMIN_COOKIES_ENV = os.environ.get("GARMIN_COOKIES", "").strip()
 
 _sync_interval_raw = os.environ.get("SYNC_INTERVAL", "30")
 try:
@@ -61,7 +61,7 @@ DRY_RUN = os.environ.get("DRY_RUN", "false").strip().lower() == "true"
 DATE_FROM = os.environ.get("DATE_FROM", "").strip()
 DATE_TO = os.environ.get("DATE_TO", "").strip()
 
-GARMIN_TOKENS_DIR = os.path.join(DATA_DIR, "garmin_tokens")
+GARMIN_COOKIE_FILE = os.path.join(DATA_DIR, "garmin_cookies")
 GARMIN_BACKOFF_FILE = os.path.join(DATA_DIR, "garmin_auth_backoff")
 SYNCED_FILE = os.path.join(DATA_DIR, "synced.txt")
 
@@ -106,8 +106,12 @@ def resolve_date_range() -> tuple[date, date]:
 
 
 # ---------------------------------------------------------------------------
-# Garmin authentication
+# Garmin client (cookie-based)
 # ---------------------------------------------------------------------------
+# NOTE: Garmin's OAuth SSO has been globally blocked for automated clients
+# since March 2026.  We use browser session cookies instead, which support
+# the weight-service endpoint.  Full body-composition FIT uploads require
+# OAuth and are not available via this path.
 
 class GarminRateLimitBackoff(Exception):
     """Raised when garmin_auth skips the attempt because a prior 429 is still
@@ -121,7 +125,7 @@ _GARMIN_BACKOFF_SECONDS = 26 * 3600
 
 def _is_garmin_rate_limit(exc: Exception) -> bool:
     """Return True if exc represents a Garmin 429 / rate-limit response."""
-    return isinstance(exc, GarminConnectTooManyRequestsError) or "429" in str(exc)
+    return "429" in str(exc)
 
 
 def _write_garmin_backoff() -> None:
@@ -134,19 +138,85 @@ def _write_garmin_backoff() -> None:
         pass
 
 
-def garmin_auth() -> Garmin:
-    """Authenticate with Garmin Connect and return a logged-in client.
+class GarminCookieClient:
+    """Thin Garmin Connect client backed by browser session cookies.
 
-    Garmin's oauth/exchange endpoint enforces a 24+ hour ban after repeated
-    429s.  To break the cycle we:
-      1. Check a cached backoff file — if still within the window, raise
-         GarminRateLimitBackoff so the caller can exit cleanly without making
-         any network request.
-      2. Make exactly one auth attempt.  No retries — every extra hit on the
-         exchange endpoint risks resetting / extending the ban.
-      3. On 429, write the backoff file (26 h from now) so the next day's run
-         also skips and gives the ban time to fully expire.
-      4. On success, remove the backoff file.
+    Supports weight-only uploads via the modern/proxy/weight-service endpoint.
+    Body-composition FIT uploads (which require OAuth) are not available.
+    """
+
+    _HOME_URL = "https://connect.garmin.com/"
+    _WEIGHT_URL = "https://connect.garmin.com/modern/proxy/weight-service/user-weight"
+
+    def __init__(self, cookie_str: str) -> None:
+        self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+            ),
+            "Origin": "https://connect.garmin.com",
+            "Referer": "https://connect.garmin.com/",
+            "NK": "NT",
+        })
+        for part in cookie_str.split(";"):
+            part = part.strip()
+            if "=" in part:
+                name, _, val = part.partition("=")
+                self._session.cookies.set(name.strip(), val.strip(), domain=".garmin.com")
+        self._csrf_token: str | None = None
+
+    def _ensure_csrf(self) -> None:
+        if self._csrf_token:
+            return
+        try:
+            resp = self._session.get(self._HOME_URL, timeout=15)
+            m = re.search(
+                r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\'](.*?)["\']',
+                resp.text,
+            )
+            if m:
+                self._csrf_token = m.group(1)
+        except Exception:
+            pass  # proceed without CSRF token; endpoint may not require it
+
+    def upload_weight(self, weight_kg: float, timestamp: str) -> None:
+        """POST a weight-only measurement to Garmin Connect.
+
+        weight_kg: weight in kilograms
+        timestamp: ISO-8601 string (UTC preferred)
+        """
+        self._ensure_csrf()
+        dt = datetime.fromisoformat(timestamp)
+        local_ts = dt.strftime("%Y-%m-%dT%H:%M:%S.000")
+        gmt_ts = dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000")
+
+        headers = {"Content-Type": "application/json"}
+        if self._csrf_token:
+            headers["X-CSRF-Token"] = self._csrf_token
+
+        resp = self._session.post(
+            self._WEIGHT_URL,
+            json={
+                "dateTimestamp": local_ts,
+                "gmtTimestamp": gmt_ts,
+                "unitKey": "kg",
+                "sourceType": "MANUAL",
+                "value": weight_kg,
+            },
+            headers=headers,
+            timeout=30,
+        )
+        if resp.status_code == 429:
+            raise RuntimeError(f"429 Too Many Requests: {resp.text[:200]}")
+        resp.raise_for_status()
+
+
+def garmin_auth() -> GarminCookieClient:
+    """Load Garmin session cookies and return a ready client.
+
+    Checks a self-imposed backoff file first.  If a prior upload 429 is still
+    within its window, raises GarminRateLimitBackoff so the caller exits cleanly.
     """
     # --- check self-imposed backoff ---
     if os.path.exists(GARMIN_BACKOFF_FILE):
@@ -156,47 +226,41 @@ def garmin_auth() -> Garmin:
             if remaining > 0:
                 hrs = remaining / 3600
                 raise GarminRateLimitBackoff(
-                    f"Garmin auth skipped: still in rate-limit backoff "
+                    f"Garmin upload skipped: still in rate-limit backoff "
                     f"({hrs:.1f}h remaining). Sync will resume automatically."
                 )
         except GarminRateLimitBackoff:
             raise
         except Exception:
-            pass  # corrupt file — attempt auth anyway
+            pass  # corrupt file — proceed anyway
 
-    os.makedirs(GARMIN_TOKENS_DIR, exist_ok=True)
-    os.chmod(GARMIN_TOKENS_DIR, 0o700)
-    tokens_exist = os.path.exists(os.path.join(GARMIN_TOKENS_DIR, "oauth1_token.json"))
-    try:
-        client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
-        if tokens_exist:
-            client.login(tokenstore=GARMIN_TOKENS_DIR)
-        else:
-            log.info("No cached Garmin tokens found; performing full login.")
-            client.login()
-            client.garth.dump(GARMIN_TOKENS_DIR)
-        log.info("Garmin authentication successful.")
-        # Clear any leftover backoff file on success.
+    # --- load cookie string ---
+    cookie_str = GARMIN_COOKIES_ENV
+    if not cookie_str and os.path.exists(GARMIN_COOKIE_FILE):
         try:
-            os.remove(GARMIN_BACKOFF_FILE)
-        except FileNotFoundError:
+            with open(GARMIN_COOKIE_FILE) as f:
+                cookie_str = f.read().strip()
+        except OSError:
             pass
-        return client
-    except (GarminConnectTooManyRequestsError, GarminConnectConnectionError) as exc:
-        # GarminConnectTooManyRequestsError: 429 on the OAuth exchange endpoint.
-        # GarminConnectConnectionError wrapping a 429: raised during a full
-        # credential login (no cached tokens) when the SSO endpoint rate-limits.
-        # Both require backoff treatment; other GarminConnectConnectionErrors
-        # (network failures, etc.) fall through to the generic handler.
-        if not _is_garmin_rate_limit(exc):
-            raise RuntimeError(f"Garmin authentication failed: {exc}") from exc
-        _write_garmin_backoff()
+
+    if not cookie_str:
         raise RuntimeError(
-            f"Garmin authentication rate-limited; "
-            f"backoff set for {_GARMIN_BACKOFF_SECONDS // 3600}h: {exc}"
-        ) from exc
-    except Exception as exc:
-        raise RuntimeError(f"Garmin authentication failed: {exc}") from exc
+            "No Garmin session cookies found. "
+            "Run generate_cookies.py locally and store the output as "
+            "the GARMIN_COOKIES GitHub secret."
+        )
+
+    # Persist to file so the cache can carry it across runs.
+    if GARMIN_COOKIES_ENV and not os.path.exists(GARMIN_COOKIE_FILE):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        try:
+            with open(GARMIN_COOKIE_FILE, "w") as f:
+                f.write(cookie_str)
+        except OSError:
+            pass
+
+    log.info("Garmin cookie client initialized.")
+    return GarminCookieClient(cookie_str)
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +377,7 @@ def log_wyze_record(record, checksum: str) -> None:
 
 def sync_once(
     wyze_token: str | None = None,
-    garmin_client: Garmin | None = None,
+    garmin_client: GarminCookieClient | None = None,
 ) -> int:
     """Run one sync cycle: fetch Wyze records, upload new ones to Garmin.
 
@@ -459,8 +523,7 @@ def sync_once(
                 continue
 
             try:
-                body_kwargs = {k: v for k, v in payload.items() if v is not None}
-                garmin_client.add_body_composition(**body_kwargs)
+                garmin_client.upload_weight(payload["weight"], payload["timestamp"])
                 mark_synced(checksum)
                 synced.add(checksum)
                 uploaded += 1
