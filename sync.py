@@ -166,6 +166,39 @@ class GarminCookieClient:
         })
         self._csrf_token: str | None = None
 
+    def _try_refresh_jwt(self) -> bool:
+        """Follow Garmin's SSO redirect to obtain a fresh JWT_WEB.
+
+        When JWT_WEB expires (~2 h), Garmin redirects API calls to SSO.
+        If the session cookie is still valid (~3 weeks), SSO will issue a
+        new JWT_WEB and redirect back.  We capture the new token from the
+        session cookie jar and update our Cookie header.
+        """
+        try:
+            sso_url = (
+                "https://sso.garmin.com/portal/sso/sign-in"
+                "?clientId=GarminConnect"
+                "&service=https%3A%2F%2Fconnect.garmin.com%2F"
+            )
+            # Follow redirects so the final connect.garmin.com response can
+            # set a new JWT_WEB via Set-Cookie.
+            self._session.get(sso_url, allow_redirects=True, timeout=20)
+            jwt = self._session.cookies.get("JWT_WEB")
+            if jwt:
+                # Splice the new JWT_WEB into our Cookie header string.
+                parts = [
+                    p.strip() for p in self._cookie_str.split(";")
+                    if not p.strip().startswith("JWT_WEB=")
+                ]
+                parts.insert(0, f"JWT_WEB={jwt}")
+                self._cookie_str = "; ".join(parts)
+                self._session.headers["Cookie"] = self._cookie_str
+                log.info("Garmin JWT_WEB refreshed via SSO session.")
+                return True
+        except Exception as exc:
+            log.debug("JWT refresh attempt failed: %s", exc)
+        return False
+
     def _ensure_csrf(self) -> None:
         if self._csrf_token:
             return
@@ -180,22 +213,11 @@ class GarminCookieClient:
         except Exception:
             pass  # proceed without CSRF token; endpoint may not require it
 
-    def upload_weight(self, weight_kg: float, timestamp: str) -> None:
-        """POST a weight-only measurement to Garmin Connect.
-
-        weight_kg: weight in kilograms
-        timestamp: ISO-8601 string (UTC preferred)
-        """
-        self._ensure_csrf()
-        dt = datetime.fromisoformat(timestamp)
-        local_ts = dt.strftime("%Y-%m-%dT%H:%M:%S.000")
-        gmt_ts = dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000")
-
+    def _post_weight(self, weight_kg: float, local_ts: str, gmt_ts: str) -> requests.Response:
         headers = {"Content-Type": "application/json"}
         if self._csrf_token:
             headers["X-CSRF-Token"] = self._csrf_token
-
-        resp = self._session.post(
+        return self._session.post(
             self._WEIGHT_URL,
             json={
                 "dateTimestamp": local_ts,
@@ -208,11 +230,34 @@ class GarminCookieClient:
             allow_redirects=False,
             timeout=30,
         )
+
+    def upload_weight(self, weight_kg: float, timestamp: str) -> None:
+        """POST a weight-only measurement to Garmin Connect.
+
+        weight_kg: weight in kilograms
+        timestamp: ISO-8601 string (UTC preferred)
+        """
+        self._ensure_csrf()
+        dt = datetime.fromisoformat(timestamp)
+        local_ts = dt.strftime("%Y-%m-%dT%H:%M:%S.000")
+        gmt_ts = dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000")
+
+        resp = self._post_weight(weight_kg, local_ts, gmt_ts)
+
+        if resp.status_code in (301, 302, 303, 307, 308):
+            # JWT_WEB likely expired — try refreshing via the SSO session flow.
+            log.info("Garmin returned redirect; attempting JWT refresh.")
+            if self._try_refresh_jwt():
+                self._csrf_token = None  # may have changed after SSO round-trip
+                self._ensure_csrf()
+                resp = self._post_weight(weight_kg, local_ts, gmt_ts)
+
         if resp.status_code in (301, 302, 303, 307, 308):
             location = resp.headers.get("Location", "")
             raise RuntimeError(
                 f"Garmin redirected weight upload to {location!r} — "
-                f"session cookies may be expired. Re-run generate_cookies.py."
+                f"session cookie has expired. Re-run generate_cookies.py "
+                f"and update the GARMIN_COOKIES secret."
             )
         if resp.status_code == 429:
             raise RuntimeError(f"429 Too Many Requests: {resp.text[:200]}")
