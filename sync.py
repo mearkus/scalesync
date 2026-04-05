@@ -141,15 +141,19 @@ def _write_garmin_backoff() -> None:
 class GarminCookieClient:
     """Thin Garmin Connect client backed by browser session cookies.
 
-    Supports weight-only uploads via the modern/proxy/weight-service endpoint.
+    Supports weight-only uploads via the app/proxy/weight-service endpoint.
     Body-composition FIT uploads (which require OAuth) are not available.
     """
 
     _HOME_URL = "https://connect.garmin.com/"
-    _WEIGHT_URL = "https://connect.garmin.com/modern/proxy/weight-service/user-weight"
+    # New Connect app uses /app/proxy/ (old /modern/proxy/ redirects to SSO)
+    _WEIGHT_URL = "https://connect.garmin.com/app/proxy/weight-service/user-weight"
 
     def __init__(self, cookie_str: str) -> None:
+        self._cookie_str = cookie_str
         self._session = requests.Session()
+        # Send cookies as a raw header — preserves all cookie attributes and
+        # avoids domain-matching issues with the requests cookie jar.
         self._session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -157,13 +161,9 @@ class GarminCookieClient:
             ),
             "Origin": "https://connect.garmin.com",
             "Referer": "https://connect.garmin.com/",
+            "Cookie": cookie_str,
             "NK": "NT",
         })
-        for part in cookie_str.split(";"):
-            part = part.strip()
-            if "=" in part:
-                name, _, val = part.partition("=")
-                self._session.cookies.set(name.strip(), val.strip(), domain=".garmin.com")
         self._csrf_token: str | None = None
 
     def _ensure_csrf(self) -> None:
@@ -205,8 +205,15 @@ class GarminCookieClient:
                 "value": weight_kg,
             },
             headers=headers,
+            allow_redirects=False,
             timeout=30,
         )
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("Location", "")
+            raise RuntimeError(
+                f"Garmin redirected weight upload to {location!r} — "
+                f"session cookies may be expired. Re-run generate_cookies.py."
+            )
         if resp.status_code == 429:
             raise RuntimeError(f"429 Too Many Requests: {resp.text[:200]}")
         resp.raise_for_status()
