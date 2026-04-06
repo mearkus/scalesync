@@ -592,6 +592,9 @@ def sync_once(
                         f"backoff set for {_GARMIN_BACKOFF_SECONDS // 3600}h. "
                         f"Stopping retries: {exc}"
                     ) from exc
+                if "redirected" in str(exc).lower():
+                    # Auth failure — retrying will not help.
+                    raise RuntimeError(str(exc)) from exc
                 log.error("Failed to upload record ts=%s: %s", record.measure_ts, exc)
 
     if DRY_RUN:
