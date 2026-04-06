@@ -1,96 +1,81 @@
 """
-One-time script to generate Garmin OAuth tokens via a real browser.
+Build Garmin OAuth token files from responses copied out of Chrome DevTools.
 
-Garmin's SSO endpoint blocks Python/curl requests (429) but allows real
-browsers. This script opens Chromium, intercepts the OAuth token exchange
-that happens during normal browser login, and saves the tokens in garth
-format for use by the GitHub Actions workflow.
+Steps:
+  1. Open Chrome, go to connect.garmin.com and log in
+  2. Open DevTools → Network tab, filter by "connectapi"
+  3. Find the request to:
+       /oauth-service/oauth/preauthorized?ticket=...
+     Copy the full response body (looks like a URL query string:
+       oauth_token=abc&oauth_token_secret=xyz&...)
+  4. Find the request to:
+       /oauth-service/oauth/exchange/user/2.0
+     Copy the full response body (JSON)
+  5. Paste each when prompted below
 
-Usage (run in a real terminal, NOT via the ! prefix in Claude Code):
+Usage (run in a real terminal):
     python3 generate_tokens.py
 """
-import asyncio
 import json
 import os
-import sys
-
-from garth.http import Client as GarthClient
-from garth.auth_tokens import OAuth1Token, OAuth2Token
-from garth import sso as garth_sso
-from playwright.async_api import async_playwright
+import time
+from urllib.parse import parse_qs
 
 TOKEN_DIR = "/tmp/garmin_tokens"
 
-# These are the connectapi.garmin.com endpoints the SSO flow exchanges
-# tokens on. We intercept them at the browser network level, bypassing
-# any Cloudflare bot detection that blocks Python requests.
-OAUTH1_PATH = "/oauth-service/oauth/preauthorized"
-OAUTH2_PATH = "/oauth-service/oauth/exchange/user/2.0"
+print("=== Step 1: oauth/preauthorized response ===")
+print("Paste the response body (URL query string), then press Enter twice:")
+lines = []
+while True:
+    line = input()
+    if line == "":
+        break
+    lines.append(line)
+oauth1_raw = "".join(lines).strip()
 
+print()
+print("=== Step 2: oauth/exchange/user/2.0 response ===")
+print("Paste the response body (JSON), then press Enter twice:")
+lines = []
+while True:
+    line = input()
+    if line == "":
+        break
+    lines.append(line)
+oauth2_raw = "".join(lines).strip()
 
-async def main():
-    oauth1_token: OAuth1Token | None = None
-    oauth2_token: OAuth2Token | None = None
-    token_event = asyncio.Event()
+# --- Parse OAuth1 (URL query string) ---
+parsed = {k: v[0] for k, v in parse_qs(oauth1_raw).items()}
+oauth1 = {
+    "oauth_token": parsed["oauth_token"],
+    "oauth_token_secret": parsed["oauth_token_secret"],
+    "domain": "garmin.com",
+}
+if "mfa_token" in parsed:
+    oauth1["mfa_token"] = parsed["mfa_token"]
+if "mfa_expiration_timestamp" in parsed:
+    oauth1["mfa_expiration_timestamp"] = parsed["mfa_expiration_timestamp"]
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context()
-        page = await context.new_page()
+# --- Parse OAuth2 (JSON) ---
+oauth2 = json.loads(oauth2_raw)
+# Add computed expiry timestamps if missing (garth requires them)
+now = int(time.time())
+if "expires_at" not in oauth2:
+    oauth2["expires_at"] = now + oauth2["expires_in"]
+if "refresh_token_expires_at" not in oauth2:
+    oauth2["refresh_token_expires_at"] = now + oauth2["refresh_token_expires_in"]
 
-        async def on_response(response):
-            nonlocal oauth1_token, oauth2_token
-            try:
-                if OAUTH1_PATH in response.url and response.status == 200:
-                    from urllib.parse import parse_qs
-                    text = await response.text()
-                    parsed = {k: v[0] for k, v in parse_qs(text).items()}
-                    oauth1_token = OAuth1Token(domain="garmin.com", **parsed)
-                    print(f"  Captured OAuth1 token")
+# --- Save ---
+os.makedirs(TOKEN_DIR, mode=0o700, exist_ok=True)
+with open(f"{TOKEN_DIR}/oauth1_token.json", "w") as f:
+    json.dump(oauth1, f, indent=4)
+with open(f"{TOKEN_DIR}/oauth2_token.json", "w") as f:
+    json.dump(oauth2, f, indent=4)
 
-                elif OAUTH2_PATH in response.url and response.status == 200:
-                    from garth.sso import set_expirations
-                    data = await response.json()
-                    oauth2_token = OAuth2Token(**set_expirations(data))
-                    print(f"  Captured OAuth2 token")
-            except Exception as e:
-                print(f"  Warning: failed to parse response from {response.url}: {e}")
+print(f"\nTokens saved to {TOKEN_DIR}/")
+for name in sorted(os.listdir(TOKEN_DIR)):
+    print(f"  {name}")
 
-            if oauth1_token and oauth2_token:
-                token_event.set()
-
-        page.on("response", on_response)
-
-        print("Opening Garmin Connect login page in browser...")
-        print("Please log in with your Garmin credentials.\n")
-        await page.goto("https://connect.garmin.com/signin")
-
-        try:
-            await asyncio.wait_for(token_event.wait(), timeout=180)
-        except asyncio.TimeoutError:
-            print("\nERROR: Timed out waiting for OAuth tokens.")
-            print("Make sure you completed the login in the browser window.")
-            await browser.close()
-            sys.exit(1)
-
-        await browser.close()
-
-    # Save tokens using garth's native dump format
-    print(f"\nSaving tokens to {TOKEN_DIR}/")
-    os.makedirs(TOKEN_DIR, mode=0o700, exist_ok=True)
-
-    client = GarthClient()
-    client.oauth1_token = oauth1_token
-    client.oauth2_token = oauth2_token
-    client.dump(TOKEN_DIR)
-
-    for f in sorted(os.listdir(TOKEN_DIR)):
-        print(f"  {f}")
-
-    print("\nNow run the following to store them as GitHub secrets:")
-    print(f'  base64 -i {TOKEN_DIR}/oauth1_token.json | tr -d "\\n" | gh secret set GARMIN_OAUTH1_TOKEN --repo mearkus/scalesync')
-    print(f'  base64 -i {TOKEN_DIR}/oauth2_token.json | tr -d "\\n" | gh secret set GARMIN_OAUTH2_TOKEN --repo mearkus/scalesync')
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+print("\nNow store them as GitHub secrets:")
+print(f'  base64 -i {TOKEN_DIR}/oauth1_token.json | tr -d "\\n" | gh secret set GARMIN_OAUTH1_TOKEN --repo mearkus/scalesync')
+print(f'  base64 -i {TOKEN_DIR}/oauth2_token.json | tr -d "\\n" | gh secret set GARMIN_OAUTH2_TOKEN --repo mearkus/scalesync')
