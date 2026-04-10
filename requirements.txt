@@ -1,2 +1,3 @@
 wyze-sdk==2.2.0
-requests
+garminconnect @ git+https://github.com/diegoscarabelli/python-garminconnect@feat/widget-cffi-login-strategy
+curl_cffi
