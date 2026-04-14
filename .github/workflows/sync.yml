@@ -1,6 +1,11 @@
 name: Sync Wyze Scale → Garmin Connect
 
+# Runs at 12:30 UTC daily (7:30 AM CDT in summer, 6:30 AM CST in winter).
+# GitHub Actions cron does not support timezones; a single fixed UTC time
+# will drift by one hour across daylight saving transitions.
 on:
+  schedule:
+    - cron: "30 12 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
