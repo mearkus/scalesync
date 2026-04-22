@@ -50,11 +50,16 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Wyze's api.wyzecam.com serves an incomplete cert chain missing the
-      # DigiCert TLS RSA SHA256 2020 CA1 intermediate. The Actions runner's
-      # system CA store doesn't have it, but certifi's bundle does.
-      - name: Set certifi CA bundle
-        run: echo "REQUESTS_CA_BUNDLE=$(python -c 'import certifi; print(certifi.where())')" >> $GITHUB_ENV
+      # requests 2.32+ uses ssl.create_default_context() which reads from the
+      # system CA store. On the Actions runner that store is missing the
+      # DigiCert Global Root CA needed to verify api.wyzecam.com.
+      # Certifi's bundle has it. SSL_CERT_FILE is read by Python's ssl module
+      # at context-creation time; REQUESTS_CA_BUNDLE covers older code paths.
+      - name: Point SSL at certifi CA bundle
+        run: |
+          CERTIFI=$(python -c 'import certifi; print(certifi.where())')
+          echo "SSL_CERT_FILE=${CERTIFI}" >> $GITHUB_ENV
+          echo "REQUESTS_CA_BUNDLE=${CERTIFI}" >> $GITHUB_ENV
 
       - name: Validate inputs
         if: github.event_name == 'workflow_dispatch'
