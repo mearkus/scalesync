@@ -6,7 +6,11 @@ from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, call, patch
 
 import pytest
-from garminconnect import GarminConnectConnectionError, GarminConnectTooManyRequestsError
+from garminconnect import (
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
 
 import sync
 
@@ -654,6 +658,47 @@ class TestGarminAuth:
             mock_garmin_cls.return_value.login.side_effect = Exception("auth failed")
             with pytest.raises(RuntimeError, match="Garmin authentication failed"):
                 sync.garmin_auth()
+
+    # --- stale cached token fallback ---
+
+    def test_stale_cached_tokens_clears_and_retries(self, tmp_path):
+        token_dir = tmp_path / "garmin_tokens"
+        self._seed_tokens(token_dir)
+        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
+             patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
+             patch("sync.Garmin") as mock_garmin_cls:
+            mock_garmin_cls.return_value.login.side_effect = [
+                GarminConnectAuthenticationError("Failed to retrieve social profile"),
+                None,
+            ]
+            sync.garmin_auth()  # should not raise
+        assert mock_garmin_cls.return_value.login.call_count == 2
+        assert not (token_dir / "oauth1_token.json").exists()
+
+    def test_authentication_error_without_cached_tokens_raises_immediately(self, tmp_path):
+        token_dir = tmp_path / "garmin_tokens"
+        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
+             patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
+             patch("sync.Garmin") as mock_garmin_cls:
+            mock_garmin_cls.return_value.login.side_effect = \
+                GarminConnectAuthenticationError("bad credentials")
+            with pytest.raises(RuntimeError, match="Garmin authentication failed"):
+                sync.garmin_auth()
+        assert mock_garmin_cls.return_value.login.call_count == 1
+
+    def test_stale_cached_tokens_retry_also_fails(self, tmp_path):
+        token_dir = tmp_path / "garmin_tokens"
+        self._seed_tokens(token_dir)
+        with patch.object(sync, "GARMIN_TOKENS_DIR", str(token_dir)), \
+             patch.object(sync, "GARMIN_BACKOFF_FILE", str(tmp_path / "backoff")), \
+             patch("sync.Garmin") as mock_garmin_cls:
+            mock_garmin_cls.return_value.login.side_effect = [
+                GarminConnectAuthenticationError("Failed to retrieve social profile"),
+                GarminConnectAuthenticationError("Failed to retrieve social profile"),
+            ]
+            with pytest.raises(RuntimeError, match="after clearing stale tokens"):
+                sync.garmin_auth()
+        assert mock_garmin_cls.return_value.login.call_count == 2
 
     # --- 429 handling ---
 

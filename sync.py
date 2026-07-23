@@ -21,10 +21,16 @@ Optional:
 import hashlib
 import logging
 import os
+import shutil
 import time as _time
 from datetime import date, datetime, timedelta, timezone
 
-from garminconnect import Garmin, GarminConnectConnectionError, GarminConnectTooManyRequestsError
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
 from wyze_sdk import Client
 from wyze_sdk.errors import WyzeApiError
 
@@ -168,16 +174,31 @@ def garmin_auth() -> Garmin:
 
     os.makedirs(GARMIN_TOKENS_DIR, exist_ok=True)
     os.chmod(GARMIN_TOKENS_DIR, 0o700)
+    had_cached_tokens = bool(os.listdir(GARMIN_TOKENS_DIR))
 
     try:
         client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
         client.login(tokenstore=GARMIN_TOKENS_DIR)
-        log.info("Garmin authentication successful.")
+    except GarminConnectAuthenticationError as exc:
+        # Cached tokens may be stale/revoked; the fork's login() silently
+        # keeps using them instead of falling back to credentials, so force
+        # a fresh login by clearing the tokenstore and retrying once.
+        if not had_cached_tokens:
+            raise RuntimeError(f"Garmin authentication failed: {exc}") from exc
+        log.warning(
+            "Garmin login failed with cached tokens (%s); clearing tokenstore "
+            "and retrying with a fresh credential login.", exc
+        )
+        shutil.rmtree(GARMIN_TOKENS_DIR, ignore_errors=True)
+        os.makedirs(GARMIN_TOKENS_DIR, exist_ok=True)
+        os.chmod(GARMIN_TOKENS_DIR, 0o700)
         try:
-            os.remove(GARMIN_BACKOFF_FILE)
-        except FileNotFoundError:
-            pass
-        return client
+            client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
+            client.login(tokenstore=GARMIN_TOKENS_DIR)
+        except Exception as retry_exc:
+            raise RuntimeError(
+                f"Garmin authentication failed after clearing stale tokens: {retry_exc}"
+            ) from retry_exc
     except (GarminConnectTooManyRequestsError, GarminConnectConnectionError) as exc:
         if not _is_garmin_rate_limit(exc):
             raise RuntimeError(f"Garmin authentication failed: {exc}") from exc
@@ -188,6 +209,13 @@ def garmin_auth() -> Garmin:
         ) from exc
     except Exception as exc:
         raise RuntimeError(f"Garmin authentication failed: {exc}") from exc
+
+    log.info("Garmin authentication successful.")
+    try:
+        os.remove(GARMIN_BACKOFF_FILE)
+    except FileNotFoundError:
+        pass
+    return client
 
 
 # ---------------------------------------------------------------------------
