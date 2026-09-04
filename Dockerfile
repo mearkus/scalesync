@@ -2,7 +2,10 @@ FROM python:3.11-alpine
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY requirements.txt ./
+# The vendored garminconnect fork is a local path requirement, so it has
+# to be present before the install runs.
+COPY vendor/ ./vendor/
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY sync.py fit.py ./

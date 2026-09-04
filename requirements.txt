@@ -1,3 +1,6 @@
 wyze-sdk==2.2.0
-garminconnect @ git+https://github.com/diegoscarabelli/python-garminconnect@feat/widget-cffi-login-strategy
+# Vendored fork of python-garminconnect (SSO embed widget + curl_cffi login).
+# Installed from the local tree because the upstream fork repo disappeared;
+# see vendor/python-garminconnect/VENDORED.md for provenance.
+./vendor/python-garminconnect
 curl_cffi
