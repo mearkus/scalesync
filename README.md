@@ -121,6 +121,8 @@ The container persists OAuth tokens and sync state in `./data/` on your host.
 ## Running locally (without Docker)
 
 ```bash
+# Run from the repo root: the Garmin client is a vendored local path
+# requirement (see vendor/python-garminconnect/VENDORED.md).
 pip install -r requirements.txt
 
 # Copy and fill in credentials
