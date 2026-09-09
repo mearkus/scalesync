@@ -12,6 +12,9 @@ from garminconnect import (
     GarminConnectTooManyRequestsError,
 )
 
+from requests.exceptions import HTTPError
+from wyze_sdk.errors import WyzeApiError
+
 import sync
 
 
@@ -755,14 +758,160 @@ class TestGarminAuth:
 # ---------------------------------------------------------------------------
 
 class TestWyzeAuth:
-    def test_returns_access_token(self):
-        with patch("sync.Client") as mock_client_cls:
+    """wyze-sdk surfaces a rate-limited login as requests' HTTPError, not
+    WyzeApiError, so these cover both shapes."""
+
+    def _http_429(self):
+        response = MagicMock()
+        response.status_code = 429
+        return HTTPError("429 Client Error: Too Many Requests", response=response)
+
+    def _no_backoff(self, tmp_path):
+        return patch.object(sync, "WYZE_BACKOFF_FILE", str(tmp_path / "wyze_backoff"))
+
+    # --- login ---
+
+    def test_returns_access_token(self, tmp_path):
+        with self._no_backoff(tmp_path), patch("sync.Client") as mock_client_cls:
             mock_client_cls.return_value.login.return_value = {"access_token": "tok123"}
             token = sync.wyze_auth()
         assert token == "tok123"
 
-    def test_raises_when_no_token_returned(self):
-        with patch("sync.Client") as mock_client_cls:
+    def test_raises_when_no_token_returned(self, tmp_path):
+        with self._no_backoff(tmp_path), patch("sync.Client") as mock_client_cls:
             mock_client_cls.return_value.login.return_value = {}
             with pytest.raises(RuntimeError, match="no access_token"):
                 sync.wyze_auth()
+
+    def test_non_rate_limit_api_error_raises_runtime_error(self, tmp_path):
+        with self._no_backoff(tmp_path), patch("sync.Client") as mock_client_cls:
+            mock_client_cls.return_value.login.side_effect = WyzeApiError("bad creds", {})
+            with pytest.raises(RuntimeError, match="Wyze authentication failed"):
+                sync.wyze_auth()
+
+    def test_non_rate_limit_http_error_raises_runtime_error(self, tmp_path):
+        response = MagicMock()
+        response.status_code = 401
+        with self._no_backoff(tmp_path), patch("sync.Client") as mock_client_cls:
+            mock_client_cls.return_value.login.side_effect = HTTPError(
+                "401 Client Error: Unauthorized", response=response
+            )
+            with pytest.raises(RuntimeError, match="Wyze authentication failed"):
+                sync.wyze_auth()
+
+    def test_non_rate_limit_error_does_not_write_backoff(self, tmp_path):
+        backoff_file = tmp_path / "wyze_backoff"
+        with patch.object(sync, "WYZE_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Client") as mock_client_cls:
+            mock_client_cls.return_value.login.side_effect = WyzeApiError("bad creds", {})
+            with pytest.raises(RuntimeError):
+                sync.wyze_auth()
+        assert not backoff_file.exists()
+
+    # --- rate-limit detection ---
+
+    def test_detects_429_from_http_error_response(self):
+        assert sync._is_wyze_rate_limit(self._http_429()) is True
+
+    def test_detects_429_in_message(self):
+        assert sync._is_wyze_rate_limit(Exception("429 Too Many Requests")) is True
+
+    def test_other_errors_are_not_rate_limits(self):
+        response = MagicMock()
+        response.status_code = 401
+        exc = HTTPError("401 Client Error: Unauthorized", response=response)
+        assert sync._is_wyze_rate_limit(exc) is False
+
+    # --- backoff file ---
+
+    def test_raises_backoff_when_file_active(self, tmp_path):
+        backoff_file = tmp_path / "wyze_backoff"
+        backoff_file.write_text(str(time.time() + 3600))
+        with patch.object(sync, "WYZE_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Client") as mock_client_cls:
+            with pytest.raises(sync.WyzeRateLimitBackoff, match="rate-limit backoff"):
+                sync.wyze_auth()
+        mock_client_cls.assert_not_called()
+
+    def test_proceeds_when_backoff_file_expired(self, tmp_path):
+        backoff_file = tmp_path / "wyze_backoff"
+        backoff_file.write_text(str(time.time() - 1))
+        with patch.object(sync, "WYZE_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Client") as mock_client_cls:
+            mock_client_cls.return_value.login.return_value = {"access_token": "tok"}
+            assert sync.wyze_auth() == "tok"
+
+    def test_proceeds_when_backoff_file_corrupt(self, tmp_path):
+        backoff_file = tmp_path / "wyze_backoff"
+        backoff_file.write_text("not-a-number")
+        with patch.object(sync, "WYZE_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Client") as mock_client_cls:
+            mock_client_cls.return_value.login.return_value = {"access_token": "tok"}
+            assert sync.wyze_auth() == "tok"
+
+    def test_clears_backoff_file_on_success(self, tmp_path):
+        backoff_file = tmp_path / "wyze_backoff"
+        backoff_file.write_text(str(time.time() - 1))
+        with patch.object(sync, "WYZE_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Client") as mock_client_cls:
+            mock_client_cls.return_value.login.return_value = {"access_token": "tok"}
+            sync.wyze_auth()
+        assert not backoff_file.exists()
+
+    # --- 429 retry behaviour ---
+
+    def test_retries_then_succeeds(self, tmp_path):
+        with self._no_backoff(tmp_path), \
+             patch("sync.Client") as mock_client_cls, \
+             patch("sync._time.sleep") as mock_sleep:
+            mock_client_cls.return_value.login.side_effect = [
+                self._http_429(),
+                {"access_token": "tok"},
+            ]
+            assert sync.wyze_auth() == "tok"
+        mock_sleep.assert_called_once_with(sync._WYZE_LOGIN_RETRY_DELAYS[0])
+
+    def test_gives_up_after_all_attempts(self, tmp_path):
+        backoff_file = tmp_path / "wyze_backoff"
+        with patch.object(sync, "WYZE_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Client") as mock_client_cls, \
+             patch("sync._time.sleep"):
+            mock_client_cls.return_value.login.side_effect = self._http_429()
+            with pytest.raises(sync.WyzeRateLimitBackoff, match="rate-limited after"):
+                sync.wyze_auth()
+        expected = len(sync._WYZE_LOGIN_RETRY_DELAYS) + 1
+        assert mock_client_cls.return_value.login.call_count == expected
+
+    def test_writes_backoff_file_when_data_dir_missing(self, tmp_path):
+        """wyze_auth runs before anything else creates DATA_DIR."""
+        data_dir = tmp_path / "not-created-yet"
+        backoff_file = data_dir / "wyze_auth_backoff"
+        with patch.object(sync, "DATA_DIR", str(data_dir)), \
+             patch.object(sync, "WYZE_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Client") as mock_client_cls, \
+             patch("sync._time.sleep"):
+            mock_client_cls.return_value.login.side_effect = self._http_429()
+            with pytest.raises(sync.WyzeRateLimitBackoff):
+                sync.wyze_auth()
+        assert backoff_file.exists()
+
+    def test_writes_backoff_file_when_exhausted(self, tmp_path):
+        backoff_file = tmp_path / "wyze_backoff"
+        with patch.object(sync, "WYZE_BACKOFF_FILE", str(backoff_file)), \
+             patch("sync.Client") as mock_client_cls, \
+             patch("sync._time.sleep"):
+            mock_client_cls.return_value.login.side_effect = self._http_429()
+            with pytest.raises(sync.WyzeRateLimitBackoff):
+                sync.wyze_auth()
+        assert backoff_file.exists()
+        assert float(backoff_file.read_text()) > time.time()
+
+    # --- timing constraints these constants have to respect ---
+
+    def test_retry_delays_fit_inside_job_timeout(self):
+        """Auth retries plus the workflow's 30-min poll must stay under 40 min."""
+        assert sum(sync._WYZE_LOGIN_RETRY_DELAYS) + 30 * 60 < 40 * 60
+
+    def test_backoff_shorter_than_daily_schedule(self):
+        """A backoff must never cause a scheduled daily run to be skipped."""
+        assert sync._WYZE_BACKOFF_SECONDS < 24 * 3600

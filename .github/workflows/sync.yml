@@ -135,12 +135,24 @@ jobs:
         run: |
           python - <<'EOF'
           import time
-          from sync import sync_once, wyze_auth, garmin_auth, GarminRateLimitBackoff
+          from sync import (
+              sync_once,
+              wyze_auth,
+              garmin_auth,
+              GarminRateLimitBackoff,
+              WyzeRateLimitBackoff,
+          )
 
           RETRY_INTERVAL_SEC = 300  # 5 minutes
           MAX_RETRIES = 6           # 30 minutes total
 
-          wyze_token = wyze_auth()
+          try:
+              wyze_token = wyze_auth()
+          except WyzeRateLimitBackoff as e:
+              # Wyze is rate-limiting logins. Exit cleanly rather than failing
+              # the run; retrying now would only prolong the limit.
+              print(str(e))
+              raise SystemExit(0)
 
           try:
               garmin_client = garmin_auth()

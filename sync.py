@@ -31,6 +31,7 @@ from garminconnect import (
     GarminConnectConnectionError,
     GarminConnectTooManyRequestsError,
 )
+from requests.exceptions import HTTPError
 from wyze_sdk import Client
 from wyze_sdk.errors import WyzeApiError
 
@@ -69,6 +70,7 @@ DATE_TO = os.environ.get("DATE_TO", "").strip()
 
 GARMIN_TOKENS_DIR = os.path.join(DATA_DIR, "garmin_tokens")
 GARMIN_BACKOFF_FILE = os.path.join(DATA_DIR, "garmin_auth_backoff")
+WYZE_BACKOFF_FILE = os.path.join(DATA_DIR, "wyze_auth_backoff")
 SYNCED_FILE = os.path.join(DATA_DIR, "synced.txt")
 
 # Wyze weight is reported in lbs; Garmin requires kg
@@ -222,22 +224,111 @@ def garmin_auth() -> Garmin:
 # Wyze authentication
 # ---------------------------------------------------------------------------
 
-def wyze_auth() -> str:
-    """Authenticate with Wyze and return an access token."""
+class WyzeRateLimitBackoff(Exception):
+    """Raised when wyze_auth gives up on a 429, either because a prior one is
+    still within its self-imposed backoff window or because the retries below
+    were exhausted."""
+
+
+# Retry delays for a rate-limited login, in seconds.  Kept short on purpose:
+# the caller may then spend up to 30 min in its own record-polling loop, and
+# the two together have to stay inside the job's 40-minute timeout.
+_WYZE_LOGIN_RETRY_DELAYS = (60, 180)
+
+# How long to self-impose a backoff once the retries are spent.  Deliberately
+# shorter than the daily schedule so a scheduled run is never skipped; it only
+# stops a manual re-dispatch from hammering a limit that is still in force.
+_WYZE_BACKOFF_SECONDS = 6 * 3600
+
+
+def _is_wyze_rate_limit(exc: Exception) -> bool:
+    """Return True if exc represents a Wyze 429 / rate-limit response."""
+    response = getattr(exc, "response", None)
+    if response is not None and getattr(response, "status_code", None) == 429:
+        return True
+    return "429" in str(exc)
+
+
+def _write_wyze_backoff() -> None:
+    """Write the backoff timestamp file so the next run skips auth.
+
+    wyze_auth() is the first thing a run does, so DATA_DIR may not exist yet;
+    without the makedirs the write below fails and the backoff is silently
+    lost.  (garmin_auth() only avoids this because it creates its token
+    directory, and with it DATA_DIR, before any backoff can be written.)
+    """
+    retry_after = _time.time() + _WYZE_BACKOFF_SECONDS
     try:
-        response = Client().login(
-            email=WYZE_EMAIL,
-            password=WYZE_PASSWORD,
-            key_id=WYZE_KEY_ID,
-            api_key=WYZE_API_KEY,
-        )
-        token = response.get("access_token")
-        if not token:
-            raise RuntimeError("Wyze login succeeded but no access_token returned.")
-        log.info("Wyze authentication successful.")
-        return token
-    except WyzeApiError as exc:
-        raise RuntimeError(f"Wyze authentication failed: {exc}") from exc
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(WYZE_BACKOFF_FILE, "w") as f:
+            f.write(str(retry_after))
+    except OSError:
+        pass
+
+
+def wyze_auth() -> str:
+    """Authenticate with Wyze and return an access token.
+
+    Checks a self-imposed backoff file first, then retries a rate-limited
+    login a few times before giving up, mirroring garmin_auth().
+
+    A 429 from the login endpoint reaches us as requests' HTTPError rather
+    than WyzeApiError, because wyze-sdk calls raise_for_status() and lets
+    that exception through unwrapped, so both types are handled here.
+    """
+    # --- check self-imposed backoff ---
+    if os.path.exists(WYZE_BACKOFF_FILE):
+        try:
+            retry_after = float(open(WYZE_BACKOFF_FILE).read().strip())
+            remaining = retry_after - _time.time()
+            if remaining > 0:
+                hrs = remaining / 3600
+                raise WyzeRateLimitBackoff(
+                    f"Wyze auth skipped: still in rate-limit backoff "
+                    f"({hrs:.1f}h remaining). Sync will resume automatically."
+                )
+        except WyzeRateLimitBackoff:
+            raise
+        except Exception:
+            pass  # corrupt file — attempt auth anyway
+
+    attempts = len(_WYZE_LOGIN_RETRY_DELAYS) + 1
+    last_exc: Exception | None = None
+
+    for attempt, delay in enumerate((*_WYZE_LOGIN_RETRY_DELAYS, None), start=1):
+        try:
+            response = Client().login(
+                email=WYZE_EMAIL,
+                password=WYZE_PASSWORD,
+                key_id=WYZE_KEY_ID,
+                api_key=WYZE_API_KEY,
+            )
+            token = response.get("access_token")
+            if not token:
+                raise RuntimeError("Wyze login succeeded but no access_token returned.")
+            log.info("Wyze authentication successful.")
+            try:
+                os.remove(WYZE_BACKOFF_FILE)
+            except FileNotFoundError:
+                pass
+            return token
+        except (WyzeApiError, HTTPError) as exc:
+            if not _is_wyze_rate_limit(exc):
+                raise RuntimeError(f"Wyze authentication failed: {exc}") from exc
+            last_exc = exc
+            if delay is None:
+                break
+            log.warning(
+                "Wyze login rate-limited (attempt %d/%d); retrying in %ds.",
+                attempt, attempts, delay,
+            )
+            _time.sleep(delay)
+
+    _write_wyze_backoff()
+    raise WyzeRateLimitBackoff(
+        f"Wyze authentication rate-limited after {attempts} attempts; "
+        f"backoff set for {_WYZE_BACKOFF_SECONDS // 3600}h: {last_exc}"
+    )
 
 
 # ---------------------------------------------------------------------------
