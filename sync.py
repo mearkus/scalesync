@@ -10,6 +10,9 @@ Required environment variables:
 
 Optional:
   SYNC_INTERVAL  - minutes between sync runs (default: 30)
+  SYNC_LOOKBACK_DAYS - how many days before today the default sync window
+                   reaches back, so measurements recorded after a run are
+                   still caught later (default: 3).
   DATA_DIR       - directory for persistent state (default: /data)
   DRY_RUN        - when "true", authenticate both services but skip uploads.
                    Default is "false" (live uploads enabled).
@@ -62,6 +65,21 @@ except ValueError:
 if not (1 <= SYNC_INTERVAL <= 1440):
     raise ValueError(f"SYNC_INTERVAL must be between 1 and 1440 minutes, got: {SYNC_INTERVAL}")
 
+# The daily window used to be just "today", which silently lost any weigh-in
+# recorded after the run had already gone (a run at 16:31 UTC never sees a
+# 23:11 UTC measurement, and the next day only looks at the next day).  Each
+# run now also re-examines the preceding few days; already-synced records are
+# skipped by checksum, so the only cost is re-listing them.
+_lookback_raw = os.environ.get("SYNC_LOOKBACK_DAYS", "3")
+try:
+    SYNC_LOOKBACK_DAYS = int(_lookback_raw)
+except ValueError:
+    raise ValueError(f"SYNC_LOOKBACK_DAYS must be an integer, got: {_lookback_raw!r}")
+if not (0 <= SYNC_LOOKBACK_DAYS <= 30):
+    raise ValueError(
+        f"SYNC_LOOKBACK_DAYS must be between 0 and 30 days, got: {SYNC_LOOKBACK_DAYS}"
+    )
+
 _data_dir_raw = os.environ.get("DATA_DIR", "/data")
 DATA_DIR = os.path.realpath(os.path.abspath(_data_dir_raw))
 DRY_RUN = os.environ.get("DRY_RUN", "false").strip().lower() == "true"
@@ -87,10 +105,16 @@ KNOWN_WYZE_SCALE_MODELS = {
 
 
 def resolve_date_range() -> tuple[date, date]:
-    """Resolve desired sync date range from env, defaulting to today."""
+    """Resolve desired sync date range from env.
+
+    With no explicit dates the window is the last SYNC_LOOKBACK_DAYS days
+    through today, so a measurement taken after a given day's run is still
+    picked up by a later one.  An explicit DATE_FROM/DATE_TO is used verbatim
+    and never widened, so backfill runs stay exactly as narrow as asked.
+    """
     if not DATE_FROM and not DATE_TO:
         today = datetime.now().date()
-        return today, today
+        return today - timedelta(days=SYNC_LOOKBACK_DAYS), today
 
     try:
         if DATE_FROM:

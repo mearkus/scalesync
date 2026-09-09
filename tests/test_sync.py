@@ -2,7 +2,7 @@
 import importlib
 import os
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -72,12 +72,38 @@ def _make_record(**kwargs):
 # ---------------------------------------------------------------------------
 
 class TestResolveDateRange:
-    def test_no_dates_returns_today(self):
-        with patch.object(sync, "DATE_FROM", ""), patch.object(sync, "DATE_TO", ""):
+    def test_no_dates_spans_the_lookback_window(self):
+        with patch.object(sync, "DATE_FROM", ""), patch.object(sync, "DATE_TO", ""), \
+             patch.object(sync, "SYNC_LOOKBACK_DAYS", 3):
+            start, end = sync.resolve_date_range()
+        today = datetime.now().date()
+        assert start == today - timedelta(days=3)
+        assert end == today
+
+    def test_lookback_of_zero_is_today_only(self):
+        with patch.object(sync, "DATE_FROM", ""), patch.object(sync, "DATE_TO", ""), \
+             patch.object(sync, "SYNC_LOOKBACK_DAYS", 0):
             start, end = sync.resolve_date_range()
         today = datetime.now().date()
         assert start == today
         assert end == today
+
+    def test_lookback_window_covers_a_record_missed_by_an_earlier_run(self):
+        """The Sep 4 case: weighed in at 18:11 local, after that day's run."""
+        missed = datetime.now().date() - timedelta(days=2)
+        with patch.object(sync, "DATE_FROM", ""), patch.object(sync, "DATE_TO", ""), \
+             patch.object(sync, "SYNC_LOOKBACK_DAYS", 3):
+            start, end = sync.resolve_date_range()
+        assert start <= missed <= end
+
+    def test_explicit_dates_are_not_widened_by_lookback(self):
+        """Backfill runs must stay exactly as narrow as asked."""
+        with patch.object(sync, "DATE_FROM", "2024-01-15"), \
+             patch.object(sync, "DATE_TO", "2024-01-15"), \
+             patch.object(sync, "SYNC_LOOKBACK_DAYS", 30):
+            start, end = sync.resolve_date_range()
+        assert start == date(2024, 1, 15)
+        assert end == date(2024, 1, 15)
 
     def test_date_from_only(self):
         with patch.object(sync, "DATE_FROM", "2024-01-15"), patch.object(sync, "DATE_TO", ""):

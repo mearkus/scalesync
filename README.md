@@ -113,7 +113,8 @@ The container persists OAuth tokens and sync state in `./data/` on your host.
 | `SYNC_INTERVAL` | `30` | Minutes between sync runs |
 | `DATA_DIR` | `/data` | Where to store tokens and synced.txt |
 | `DRY_RUN` | `false` | Set `true` to log only and skip Garmin uploads |
-| `DATE_FROM` | *(today)* | Optional start date (`YYYY-MM-DD`) |
+| `SYNC_LOOKBACK_DAYS` | `3` | Days before today the default window reaches back, so a weigh-in recorded after a run is still caught by a later one |
+| `DATE_FROM` | *(lookback window)* | Optional start date (`YYYY-MM-DD`); used verbatim, overrides the lookback |
 | `DATE_TO` | *(today)* | Optional end date (`YYYY-MM-DD`) |
 
 ---
